@@ -139,6 +139,7 @@ func createTan(cfg config.NodeHostConfig, cb config.LogDBCallback,
 			cfg.Expert.ArchiveIO,
 			cfg.Expert.LogDB.MaxLogFileSize,
 			singleNodeLog,
+			cfg.Expert.LogDB.DisablePrealloc,
 		),
 	}
 	for i := 0; i < len(ldb.buffers); i++ {

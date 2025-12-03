@@ -780,6 +780,9 @@ type LogDBConfig struct {
 	SaveBufferSize                     uint64
 	MaxSaveBufferSize                  uint64
 	MaxLogFileSize                     uint64
+	// DisablePrealloc disables file preallocation using fallocate. This is useful
+	// when the filesystem (e.g., NFS) does not support fallocate system call.
+	DisablePrealloc                    bool
 }
 
 // GetDefaultLogDBConfig returns the default configurations for the LogDB

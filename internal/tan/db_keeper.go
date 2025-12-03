@@ -132,10 +132,12 @@ type collection struct {
 	maxLogFileSize uint64
 	// archiveIO archives the log and index file to remote storage.
 	archiveIO config.ArchiveIO
+	// disablePrealloc disables file preallocation using fallocate.
+	disablePrealloc bool
 }
 
 func newCollection(
-	dirname string, fs vfs.FS, archiveIO config.ArchiveIO, maxLogFileSize uint64, regular bool,
+	dirname string, fs vfs.FS, archiveIO config.ArchiveIO, maxLogFileSize uint64, regular bool, disablePrealloc bool,
 ) collection {
 	var k dbKeeper
 	if regular {
@@ -144,11 +146,12 @@ func newCollection(
 		k = newMultiplexedDBKeeper()
 	}
 	return collection{
-		fs:             fs,
-		dirname:        dirname,
-		keeper:         k,
-		maxLogFileSize: maxLogFileSize,
-		archiveIO:      archiveIO,
+		fs:               fs,
+		dirname:          dirname,
+		keeper:           k,
+		maxLogFileSize:   maxLogFileSize,
+		archiveIO:        archiveIO,
+		disablePrealloc:  disablePrealloc,
 	}
 }
 
@@ -179,6 +182,7 @@ func (c *collection) getDB(shardID uint64, replicaID uint64) (*db, error) {
 			MaxLogFileSize: int64(c.maxLogFileSize),
 			FS:             c.fs,
 			archiveIO:      c.archiveIO,
+			DisablePrealloc: c.disablePrealloc,
 		},
 	)
 	if err != nil {

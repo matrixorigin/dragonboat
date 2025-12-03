@@ -25,6 +25,6 @@ import (
 	"github.com/lni/vfs"
 )
 
-func prealloc(f vfs.File, size int64) error {
+func prealloc(f vfs.File, size int64, disablePrealloc bool) error {
 	return nil
 }

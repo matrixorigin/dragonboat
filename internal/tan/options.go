@@ -37,6 +37,9 @@ type Options struct {
 	FS                  vfs.FS
 	// archiveIO is used to archive the log files to remote storage.
 	archiveIO config.ArchiveIO
+	// DisablePrealloc disables file preallocation using fallocate. This is useful
+	// when the filesystem (e.g., NFS) does not support fallocate system call.
+	DisablePrealloc bool
 }
 
 // EnsureDefaults ensures that the default values for all options are set if a

@@ -199,7 +199,7 @@ func (d *db) createNewLog() error {
 	if err != nil {
 		return err
 	}
-	if err := prealloc(logFile, d.opts.MaxLogFileSize+indexBlockSize); err != nil {
+	if err := prealloc(logFile, d.opts.MaxLogFileSize+indexBlockSize, d.opts.DisablePrealloc); err != nil {
 		return err
 	}
 	if err := d.dataDir.Sync(); err != nil {
