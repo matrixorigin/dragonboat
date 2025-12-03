@@ -29,7 +29,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func prealloc(f vfs.File, size int64) error {
+func prealloc(f vfs.File, size int64, disablePrealloc bool) error {
+	if disablePrealloc {
+		return nil
+	}
 	osf, ok := f.(*os.File)
 	if !ok {
 		return nil
