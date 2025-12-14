@@ -423,14 +423,21 @@ func GetProcessedSnapshotRecord(
 		old.Membership.Witnesses, membershipImmovable)
 	for nid, addr := range members {
 		if membershipImmovable {
+			found := false
 			if _, ok := old.Membership.Addresses[nid]; ok {
 				ss.Membership.Addresses[nid] = addr
+				found = true
 			}
 			if _, ok := old.Membership.NonVotings[nid]; ok {
 				ss.Membership.NonVotings[nid] = addr
+				found = true
 			}
 			if _, ok := old.Membership.Witnesses[nid]; ok {
 				ss.Membership.Witnesses[nid] = addr
+				found = true
+			}
+			if !found {
+				ss.Membership.Addresses[nid] = addr
 			}
 		} else {
 			ss.Membership.Addresses[nid] = addr
