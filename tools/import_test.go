@@ -293,9 +293,10 @@ func TestGetProcessedSnapshotRecord(t *testing.T) {
 		Checksum: make([]byte, 8),
 		Dummy:    false,
 		Membership: pb.Membership{
-			Removed:    make(map[uint64]bool),
-			NonVotings: make(map[uint64]string),
-			Addresses:  make(map[uint64]string),
+			ConfigChangeId: 101,
+			Removed:        make(map[uint64]bool),
+			NonVotings:     make(map[uint64]string),
+			Addresses:      make(map[uint64]string),
 		},
 		Type:    pb.OnDiskStateMachine,
 		ShardID: 345,
@@ -322,10 +323,15 @@ func TestGetProcessedSnapshotRecord(t *testing.T) {
 	members := make(map[uint64]string)
 	members[1] = "a1"
 	members[5] = "a5"
+	configChangeID := uint64(202)
 	finalDir := "final_data"
-	newss := GetProcessedSnapshotRecord(finalDir, ss, members, fs, false)
+	newss := GetProcessedSnapshotRecord(finalDir, ss, members, configChangeID, fs, false)
 	if newss.Index != ss.Index || newss.Term != ss.Term {
 		t.Errorf("index/term not copied")
+	}
+	if newss.Membership.ConfigChangeId != configChangeID {
+		t.Errorf("config change id not copied, %d, want %d",
+			newss.Membership.ConfigChangeId, configChangeID)
 	}
 	if newss.Dummy != ss.Dummy || newss.ShardID != ss.ShardID || newss.Type != ss.Type {
 		t.Errorf("dummy/ShardId/Type fields not copied")

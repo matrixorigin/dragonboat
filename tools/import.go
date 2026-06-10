@@ -217,6 +217,7 @@ func ImportSnapshot(nhConfig config.NodeHostConfig,
 		finalDir,
 		oldss,
 		memberNodes,
+		oldss.Membership.ConfigChangeId,
 		fs,
 		nhConfig.Expert.MembershipImmovable,
 	)
@@ -371,6 +372,7 @@ func GetProcessedSnapshotRecord(
 	dstDir string,
 	old pb.Snapshot,
 	members map[uint64]string,
+	configChangeID uint64,
 	fs vfs.IFS,
 	membershipImmovable bool,
 ) pb.Snapshot {
@@ -385,7 +387,7 @@ func GetProcessedSnapshotRecord(
 		Checksum: old.Checksum,
 		Dummy:    old.Dummy,
 		Membership: pb.Membership{
-			ConfigChangeId: old.Index,
+			ConfigChangeId: configChangeID,
 			Removed:        make(map[uint64]bool),
 			NonVotings:     make(map[uint64]string),
 			Addresses:      make(map[uint64]string),

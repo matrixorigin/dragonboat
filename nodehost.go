@@ -1090,6 +1090,7 @@ func (nh *NodeHost) SyncRequestImportSnapshot(
 		finalDir,
 		srcSnapshot,
 		mergeMap(members.Nodes, members.NonVotings, members.Witnesses),
+		members.ConfigChangeID,
 		nh.fs,
 		nh.nhConfig.Expert.MembershipImmovable,
 	)
