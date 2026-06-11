@@ -1046,6 +1046,19 @@ func (nh *NodeHost) SyncRequestImportSnapshot(
 	if !ok {
 		return tools.ErrIncompleteSnapshot
 	}
+	n, ok := nh.getShard(shardID)
+	if !ok {
+		return ErrShardNotFound
+	}
+	if n.replicaID != replicaID {
+		return ErrShardNotFound
+	}
+	if !snapshotMembershipCanBeImported(
+		srcSnapshot.Membership, n.sm.GetMembership(), replicaID) {
+		plog.Errorf("imported snapshot membership has invalid role for replica %d",
+			replicaID)
+		return tools.ErrInvalidMembers
+	}
 	// Get the snapshot destination directory for the replica.
 	ssDir := nh.env.GetSnapshotDir(nh.nhConfig.DeploymentID,
 		srcSnapshot.ShardID, replicaID)
@@ -1070,40 +1083,68 @@ func (nh *NodeHost) SyncRequestImportSnapshot(
 	}
 	dstDir := ssEnv.GetTempDir()
 	finalDir := ssEnv.GetFinalDir()
-	members, err := nh.SyncGetShardMembership(ctx, shardID)
-	if err != nil {
-		return err
-	}
-	mergeMap := func(maps ...map[uint64]string) map[uint64]string {
-		ret := make(map[uint64]string)
-		for _, m := range maps {
-			for k, v := range m {
-				ret[k] = v
-			}
-		}
-		return ret
-	}
-	// Get a new snapshot record, mainly the members. Because members may be different
-	// from those in source snapshot. So we need update members according to current
-	// member in system.
-	ss := tools.GetProcessedSnapshotRecord(
+	ss := tools.GetProcessedSnapshotRecordWithOriginalMembership(
 		finalDir,
 		srcSnapshot,
-		mergeMap(members.Nodes, members.NonVotings, members.Witnesses),
-		members.ConfigChangeID,
 		nh.fs,
-		nh.nhConfig.Expert.MembershipImmovable,
 	)
 	// Just copy source snapshot directory to destination directory.
 	if err := tools.CopySnapshot(srcSnapshot, srcDir, dstDir, nh.fs); err != nil {
 		return err
 	}
-	n, ok := nh.getShard(shardID)
-	if !ok {
-		return ErrShardNotFound
-	}
 	defer nh.engine.setStepReady(shardID)
 	return n.requestImportSnapshot(ss)
+}
+
+type membershipReplicaRole uint64
+
+const (
+	membershipReplicaInvalid membershipReplicaRole = iota
+	membershipReplicaVoting
+	membershipReplicaNonVoting
+	membershipReplicaWitness
+)
+
+func snapshotMembershipCanBeImported(
+	m pb.Membership, current pb.Membership, replicaID uint64,
+) bool {
+	importedRole := getMembershipReplicaRole(m, replicaID)
+	currentRole := getMembershipReplicaRole(current, replicaID)
+	switch importedRole {
+	case membershipReplicaVoting:
+		return currentRole == membershipReplicaVoting ||
+			currentRole == membershipReplicaNonVoting
+	case membershipReplicaNonVoting:
+		return currentRole == membershipReplicaNonVoting
+	case membershipReplicaWitness:
+		return currentRole == membershipReplicaWitness
+	default:
+		return false
+	}
+}
+
+func getMembershipReplicaRole(m pb.Membership, replicaID uint64) membershipReplicaRole {
+	if _, ok := m.Removed[replicaID]; ok {
+		return membershipReplicaInvalid
+	}
+	count := 0
+	role := membershipReplicaInvalid
+	if _, ok := m.Addresses[replicaID]; ok {
+		count++
+		role = membershipReplicaVoting
+	}
+	if _, ok := m.NonVotings[replicaID]; ok {
+		count++
+		role = membershipReplicaNonVoting
+	}
+	if _, ok := m.Witnesses[replicaID]; ok {
+		count++
+		role = membershipReplicaWitness
+	}
+	if count != 1 {
+		return membershipReplicaInvalid
+	}
+	return role
 }
 
 // SyncRequestDeleteReplica is the synchronous variant of the RequestDeleteReplica

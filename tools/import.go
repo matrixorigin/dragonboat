@@ -217,7 +217,6 @@ func ImportSnapshot(nhConfig config.NodeHostConfig,
 		finalDir,
 		oldss,
 		memberNodes,
-		oldss.Membership.ConfigChangeId,
 		fs,
 		nhConfig.Expert.MembershipImmovable,
 	)
@@ -372,31 +371,16 @@ func GetProcessedSnapshotRecord(
 	dstDir string,
 	old pb.Snapshot,
 	members map[uint64]string,
-	configChangeID uint64,
 	fs vfs.IFS,
 	membershipImmovable bool,
 ) pb.Snapshot {
-	for _, file := range old.Files {
-		file.Filepath = fs.PathJoin(dstDir, fs.PathBase(file.Filepath))
-	}
-	ss := pb.Snapshot{
-		Filepath: fs.PathJoin(dstDir, fs.PathBase(old.Filepath)),
-		FileSize: old.FileSize,
-		Index:    old.Index,
-		Term:     old.Term,
-		Checksum: old.Checksum,
-		Dummy:    old.Dummy,
-		Membership: pb.Membership{
-			ConfigChangeId: configChangeID,
-			Removed:        make(map[uint64]bool),
-			NonVotings:     make(map[uint64]string),
-			Addresses:      make(map[uint64]string),
-			Witnesses:      make(map[uint64]string),
-		},
-		Files:    old.Files,
-		Type:     old.Type,
-		ShardID:  old.ShardID,
-		Imported: true,
+	ss := getProcessedSnapshotRecord(dstDir, old, fs)
+	ss.Membership = pb.Membership{
+		ConfigChangeId: old.Membership.ConfigChangeId,
+		Removed:        make(map[uint64]bool),
+		NonVotings:     make(map[uint64]string),
+		Addresses:      make(map[uint64]string),
+		Witnesses:      make(map[uint64]string),
 	}
 	for nid := range old.Membership.Addresses {
 		_, ok := members[nid]
@@ -446,6 +430,73 @@ func GetProcessedSnapshotRecord(
 		}
 	}
 	return ss
+}
+
+func GetProcessedSnapshotRecordWithOriginalMembership(
+	dstDir string,
+	old pb.Snapshot,
+	fs vfs.IFS,
+) pb.Snapshot {
+	ss := getProcessedSnapshotRecord(dstDir, old, fs)
+	ss.Membership = cloneMembership(old.Membership)
+	return ss
+}
+
+func getProcessedSnapshotRecord(
+	dstDir string,
+	old pb.Snapshot,
+	fs vfs.IFS,
+) pb.Snapshot {
+	files := make([]*pb.SnapshotFile, 0, len(old.Files))
+	for _, file := range old.Files {
+		copied := *file
+		copied.Filepath = fs.PathJoin(dstDir, fs.PathBase(file.Filepath))
+		files = append(files, &copied)
+	}
+	return pb.Snapshot{
+		Filepath: fs.PathJoin(dstDir, fs.PathBase(old.Filepath)),
+		FileSize: old.FileSize,
+		Index:    old.Index,
+		Term:     old.Term,
+		Checksum: old.Checksum,
+		Dummy:    old.Dummy,
+		Files:    files,
+		Type:     old.Type,
+		ShardID:  old.ShardID,
+		Imported: true,
+	}
+}
+
+func cloneMembership(m pb.Membership) pb.Membership {
+	return pb.Membership{
+		ConfigChangeId: m.ConfigChangeId,
+		Addresses:      cloneStringMap(m.Addresses),
+		Removed:        cloneBoolMap(m.Removed),
+		NonVotings:     cloneStringMap(m.NonVotings),
+		Witnesses:      cloneStringMap(m.Witnesses),
+	}
+}
+
+func cloneStringMap(m map[uint64]string) map[uint64]string {
+	if m == nil {
+		return nil
+	}
+	result := make(map[uint64]string, len(m))
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
+}
+
+func cloneBoolMap(m map[uint64]bool) map[uint64]bool {
+	if m == nil {
+		return nil
+	}
+	result := make(map[uint64]bool, len(m))
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
 }
 
 func CopySnapshot(ss pb.Snapshot,

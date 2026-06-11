@@ -4381,6 +4381,101 @@ func TestShardWithoutQuorumCanBeRestoreByImportingSnapshot(t *testing.T) {
 	runNodeHostTestDC(t, tf, true, fs)
 }
 
+func TestSnapshotMembershipCanBeImported(t *testing.T) {
+	const target uint64 = 1
+	addr := "localhost:26001"
+	voting := func() pb.Membership {
+		return pb.Membership{Addresses: map[uint64]string{target: addr}}
+	}
+	nonVoting := func() pb.Membership {
+		return pb.Membership{NonVotings: map[uint64]string{target: addr}}
+	}
+	witness := func() pb.Membership {
+		return pb.Membership{Witnesses: map[uint64]string{target: addr}}
+	}
+	removed := func() pb.Membership {
+		return pb.Membership{
+			Addresses: map[uint64]string{target: addr},
+			Removed:   map[uint64]bool{target: false},
+		}
+	}
+	duplicated := func() pb.Membership {
+		return pb.Membership{
+			Addresses:  map[uint64]string{target: addr},
+			NonVotings: map[uint64]string{target: addr},
+		}
+	}
+	tests := []struct {
+		name     string
+		imported pb.Membership
+		current  pb.Membership
+		ok       bool
+	}{
+		{
+			name:     "voting imports voting",
+			imported: voting(),
+			current:  voting(),
+			ok:       true,
+		},
+		{
+			name:     "voting rejects non-voting",
+			imported: nonVoting(),
+			current:  voting(),
+		},
+		{
+			name:     "voting rejects witness",
+			imported: witness(),
+			current:  voting(),
+		},
+		{
+			name:     "non-voting imports non-voting",
+			imported: nonVoting(),
+			current:  nonVoting(),
+			ok:       true,
+		},
+		{
+			name:     "non-voting imports promoted voting",
+			imported: voting(),
+			current:  nonVoting(),
+			ok:       true,
+		},
+		{
+			name:     "witness imports witness",
+			imported: witness(),
+			current:  witness(),
+			ok:       true,
+		},
+		{
+			name:     "witness rejects voting",
+			imported: voting(),
+			current:  witness(),
+		},
+		{
+			name:     "removed target rejected",
+			imported: removed(),
+			current:  voting(),
+		},
+		{
+			name:     "duplicated target role rejected",
+			imported: duplicated(),
+			current:  voting(),
+		},
+		{
+			name:     "missing target rejected",
+			imported: pb.Membership{Addresses: map[uint64]string{2: "localhost:26002"}},
+			current:  voting(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := snapshotMembershipCanBeImported(
+				tt.imported, tt.current, target); got != tt.ok {
+				t.Fatalf("got %t, want %t", got, tt.ok)
+			}
+		})
+	}
+}
+
 func TestRequestImportSnapshotAndQueryLog(t *testing.T) {
 	if vfs.GetTestFS() != vfs.DefaultFS {
 		t.Skip("not using the default fs")
@@ -4474,11 +4569,85 @@ func TestRequestImportSnapshotAndQueryLog(t *testing.T) {
 		}
 		snapshotDir := fmt.Sprintf("snapshot-%016X", index)
 		dir := fs.PathJoin(sspath, snapshotDir)
+		srcSnapshot, err := tools.GetSnapshotRecord(dir, server.MetadataFilename, fs)
+		if err != nil {
+			t.Fatalf("failed to get source snapshot record %v", err)
+		}
+		assertInvalidSnapshot := func(ss pb.Snapshot) {
+			t.Helper()
+			if err := fileutil.CreateFlagFile(dir, server.MetadataFilename,
+				&ss, fs); err != nil {
+				t.Fatalf("failed to update source snapshot record %v", err)
+			}
+			ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+			err = nh.SyncRequestImportSnapshot(ctx, 1, 1, dir)
+			cancel()
+			if !errors.Is(err, tools.ErrInvalidMembers) {
+				t.Fatalf("got %v, want %v", err, tools.ErrInvalidMembers)
+			}
+		}
+		missingReplica := srcSnapshot
+		missingReplica.Membership = pb.Membership{
+			ConfigChangeId: srcSnapshot.Membership.ConfigChangeId,
+			Addresses:      map[uint64]string{2: "noidea:8080"},
+		}
+		assertInvalidSnapshot(missingReplica)
+		targetAddr, ok := srcSnapshot.Membership.Addresses[1]
+		if !ok {
+			t.Fatalf("source snapshot does not contain target replica")
+		}
+		mismatchedReplica := srcSnapshot
+		mismatchedReplica.Membership = pb.Membership{
+			ConfigChangeId: srcSnapshot.Membership.ConfigChangeId,
+			Addresses:      map[uint64]string{2: "noidea:8080"},
+		}
+		if err := fileutil.CreateFlagFile(dir, server.MetadataFilename,
+			&mismatchedReplica, fs); err != nil {
+			t.Fatalf("failed to update source snapshot record %v", err)
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+		err = nh.SyncRequestImportSnapshot(ctx, 1, 2, dir)
+		cancel()
+		if !errors.Is(err, ErrShardNotFound) {
+			t.Fatalf("got %v, want %v", err, ErrShardNotFound)
+		}
+		removedReplica := srcSnapshot
+		removedReplica.Membership = pb.Membership{
+			ConfigChangeId: srcSnapshot.Membership.ConfigChangeId,
+			Addresses:      map[uint64]string{1: targetAddr},
+			Removed:        map[uint64]bool{1: false},
+		}
+		assertInvalidSnapshot(removedReplica)
+		nonVotingReplica := srcSnapshot
+		nonVotingReplica.Membership = pb.Membership{
+			ConfigChangeId: srcSnapshot.Membership.ConfigChangeId,
+			Addresses:      map[uint64]string{2: "noidea:8080"},
+			NonVotings:     map[uint64]string{1: targetAddr},
+		}
+		assertInvalidSnapshot(nonVotingReplica)
+		witnessReplica := srcSnapshot
+		witnessReplica.Membership = pb.Membership{
+			ConfigChangeId: srcSnapshot.Membership.ConfigChangeId,
+			Addresses:      map[uint64]string{2: "noidea:8080"},
+			Witnesses:      map[uint64]string{1: targetAddr},
+		}
+		assertInvalidSnapshot(witnessReplica)
+		if err := fileutil.CreateFlagFile(dir, server.MetadataFilename,
+			&srcSnapshot, fs); err != nil {
+			t.Fatalf("failed to restore source snapshot record %v", err)
+		}
 		ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
 		if err := nh.SyncRequestImportSnapshot(ctx, 1, 1, dir); err != nil {
 			t.Fatalf("failed to import snapshot %v", err)
 		}
 		cancel()
+		logReader, err := nh.GetLogReader(1)
+		if err != nil {
+			t.Fatalf("failed to get log reader %v", err)
+		}
+		imported := logReader.Snapshot()
+		assert.Equal(t, srcSnapshot.Membership, imported.Membership)
+		assert.NotEqual(t, index, imported.Membership.ConfigChangeId)
 
 		// SyncRequestImportSnapshot imports the snapshot synchronously, but compact log entries
 		// asynchronously, this is ok for application because we can accept less compaction.
