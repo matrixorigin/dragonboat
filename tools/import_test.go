@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"reflect"
 	"testing"
 
 	"github.com/lni/dragonboat/v4/config"
@@ -293,9 +294,11 @@ func TestGetProcessedSnapshotRecord(t *testing.T) {
 		Checksum: make([]byte, 8),
 		Dummy:    false,
 		Membership: pb.Membership{
-			Removed:    make(map[uint64]bool),
-			NonVotings: make(map[uint64]string),
-			Addresses:  make(map[uint64]string),
+			ConfigChangeId: 101,
+			Removed:        make(map[uint64]bool),
+			NonVotings:     make(map[uint64]string),
+			Addresses:      make(map[uint64]string),
+			Witnesses:      make(map[uint64]string),
 		},
 		Type:    pb.OnDiskStateMachine,
 		ShardID: 345,
@@ -305,6 +308,7 @@ func TestGetProcessedSnapshotRecord(t *testing.T) {
 	ss.Membership.Addresses[2] = "a2"
 	ss.Membership.Removed[3] = true
 	ss.Membership.NonVotings[4] = "a4"
+	ss.Membership.Witnesses[6] = "a6"
 	f1 := &pb.SnapshotFile{
 		Filepath: "/original_dir/external-1",
 		FileSize: 1,
@@ -326,6 +330,13 @@ func TestGetProcessedSnapshotRecord(t *testing.T) {
 	newss := GetProcessedSnapshotRecord(finalDir, ss, members, fs, false)
 	if newss.Index != ss.Index || newss.Term != ss.Term {
 		t.Errorf("index/term not copied")
+	}
+	if newss.Membership.ConfigChangeId != ss.Membership.ConfigChangeId {
+		t.Errorf("config change id not copied, %d, want %d",
+			newss.Membership.ConfigChangeId, ss.Membership.ConfigChangeId)
+	}
+	if newss.Membership.ConfigChangeId == newss.Index {
+		t.Errorf("config change id unexpectedly copied from snapshot index")
 	}
 	if newss.Dummy != ss.Dummy || newss.ShardID != ss.ShardID || newss.Type != ss.Type {
 		t.Errorf("dummy/ShardId/Type fields not copied")
@@ -356,13 +367,62 @@ func TestGetProcessedSnapshotRecord(t *testing.T) {
 	if len(newss.Membership.NonVotings) != 0 {
 		t.Errorf("NonVotings not empty")
 	}
-	if len(newss.Membership.Removed) != 3 {
+	if len(newss.Membership.Removed) != 4 {
 		t.Errorf("unexpected removed count")
 	}
 	_, ok1 := newss.Membership.Removed[2]
 	_, ok2 := newss.Membership.Removed[3]
 	_, ok3 := newss.Membership.Removed[4]
-	if !ok1 || !ok2 || !ok3 {
+	_, ok4 := newss.Membership.Removed[6]
+	if !ok1 || !ok2 || !ok3 || !ok4 {
 		t.Errorf("unexpected removed content")
+	}
+}
+
+func TestGetProcessedSnapshotRecordWithOriginalMembership(t *testing.T) {
+	fs := vfs.GetTestFS()
+	ss := pb.Snapshot{
+		Filepath: "/original_dir/test.gbsnap",
+		FileSize: 123,
+		Index:    1023,
+		Term:     10,
+		Checksum: make([]byte, 8),
+		Membership: pb.Membership{
+			ConfigChangeId: 101,
+			Addresses:      map[uint64]string{1: "a1", 2: "a2"},
+			Removed:        map[uint64]bool{3: true},
+			NonVotings:     map[uint64]string{4: "a4"},
+			Witnesses:      map[uint64]string{5: "a5"},
+		},
+		Type:    pb.OnDiskStateMachine,
+		ShardID: 345,
+		Files: []*pb.SnapshotFile{{
+			Filepath: "/original_dir/external-1",
+			FileSize: 1,
+			FileId:   1,
+			Metadata: make([]byte, 8),
+		}},
+	}
+	finalDir := "final_data"
+	newss := GetProcessedSnapshotRecordWithOriginalMembership(finalDir, ss, fs)
+	if !reflect.DeepEqual(newss.Membership, ss.Membership) {
+		t.Errorf("membership not preserved, %+v, want %+v",
+			newss.Membership, ss.Membership)
+	}
+	if newss.Membership.ConfigChangeId == newss.Index {
+		t.Errorf("config change id unexpectedly copied from snapshot index")
+	}
+	if fs.PathDir(newss.Filepath) != finalDir {
+		t.Errorf("filepath not processed %s", newss.Filepath)
+	}
+	if fs.PathDir(newss.Files[0].Filepath) != finalDir {
+		t.Errorf("filepath in files not processed %s", newss.Files[0].Filepath)
+	}
+	newss.Membership.Addresses[1] = "changed"
+	if ss.Membership.Addresses[1] != "a1" {
+		t.Errorf("membership was not deep copied")
+	}
+	if ss.Files[0].Filepath != "/original_dir/external-1" {
+		t.Errorf("snapshot files were not copied before processing")
 	}
 }
