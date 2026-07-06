@@ -19,9 +19,11 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"net"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/cockroachdb/errors"
 	"github.com/hashicorp/memberlist"
@@ -34,6 +36,14 @@ import (
 
 var firstError = utils.FirstError
 var plog = logger.GetLogger("registry")
+
+const (
+	nodeHostStateUnknown = "unknown"
+	nodeHostStateAlive   = "alive"
+	nodeHostStateSuspect = "suspect"
+	nodeHostStateDead    = "dead"
+	nodeHostStateLeft    = "left"
+)
 
 type getShardInfo func() []ShardInfo
 
@@ -385,8 +395,57 @@ func (g *gossipManager) Close() error {
 
 func (g *gossipManager) GetNodeHostRegistry() *NodeHostRegistry {
 	return &NodeHostRegistry{
-		view:  g.view,
-		store: g.store,
+		getNodeHostState: g.getNodeHostState,
+		view:             g.view,
+		store:            g.store,
+	}
+}
+
+func (g *gossipManager) getNodeHostState(nhid string) (string, time.Time, bool) {
+	if g.cfg.Name == nhid {
+		return nodeHostStateAlive, time.Time{}, true
+	}
+	return getMemberlistNodeState(g.list, nhid)
+}
+
+func getMemberlistNodeState(list *memberlist.Memberlist, nhid string) (string, time.Time, bool) {
+	if list == nil {
+		return nodeHostStateUnknown, time.Time{}, false
+	}
+	v := reflect.ValueOf(list).Elem()
+	lockField := v.FieldByName("nodeLock")
+	mapField := v.FieldByName("nodeMap")
+	if !lockField.IsValid() || !mapField.IsValid() {
+		return nodeHostStateUnknown, time.Time{}, false
+	}
+	lock := (*sync.RWMutex)(unsafe.Pointer(lockField.UnsafeAddr()))
+	lock.RLock()
+	defer lock.RUnlock()
+
+	nodeMap := reflect.NewAt(mapField.Type(), unsafe.Pointer(mapField.UnsafeAddr())).Elem()
+	stateValue := nodeMap.MapIndex(reflect.ValueOf(nhid))
+	if !stateValue.IsValid() || stateValue.IsNil() {
+		return nodeHostStateUnknown, time.Time{}, false
+	}
+	state := stateValue.Elem()
+	stateField := state.FieldByName("State")
+	changeField := state.FieldByName("StateChange")
+	if !stateField.IsValid() || !changeField.IsValid() {
+		return nodeHostStateUnknown, time.Time{}, false
+	}
+
+	change := reflect.NewAt(changeField.Type(), unsafe.Pointer(changeField.UnsafeAddr())).Elem().Interface().(time.Time)
+	switch memberlist.NodeStateType(stateField.Int()) {
+	case memberlist.StateAlive:
+		return nodeHostStateAlive, change, true
+	case memberlist.StateSuspect:
+		return nodeHostStateSuspect, change, true
+	case memberlist.StateDead:
+		return nodeHostStateDead, change, true
+	case memberlist.StateLeft:
+		return nodeHostStateLeft, change, true
+	default:
+		return nodeHostStateUnknown, change, true
 	}
 }
 

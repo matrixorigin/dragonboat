@@ -14,10 +14,13 @@
 
 package registry
 
+import "time"
+
 // NodeHostRegistry is a NodeHost info registry backed by gossip.
 type NodeHostRegistry struct {
-	store *metaStore
-	view  *view
+	getNodeHostState func(string) (string, time.Time, bool)
+	store            *metaStore
+	view             *view
 }
 
 // NumOfShards returns the number of shards known to the current NodeHost
@@ -34,6 +37,15 @@ func (r *NodeHostRegistry) GetMeta(nhID string) ([]byte, bool) {
 		return nil, false
 	}
 	return m.Data, true
+}
+
+// GetNodeHostState returns the current memberlist state for the specified
+// NodeHost ID.
+func (r *NodeHostRegistry) GetNodeHostState(nhID string) (string, time.Time, bool) {
+	if r.getNodeHostState == nil {
+		return nodeHostStateUnknown, time.Time{}, false
+	}
+	return r.getNodeHostState(nhID)
 }
 
 // GetShardInfo returns the shard info for the specified shard if it is
