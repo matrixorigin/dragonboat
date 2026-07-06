@@ -14,10 +14,29 @@
 
 package dragonboat
 
+import "time"
+
+const (
+	// NodeHostStateUnknown indicates that the nodehost state is unavailable.
+	NodeHostStateUnknown = "unknown"
+	// NodeHostStateAlive indicates that memberlist currently considers the
+	// nodehost alive.
+	NodeHostStateAlive = "alive"
+	// NodeHostStateSuspect indicates that memberlist currently suspects the
+	// nodehost is unreachable but has not marked it dead yet.
+	NodeHostStateSuspect = "suspect"
+	// NodeHostStateDead indicates that memberlist has marked the nodehost dead.
+	NodeHostStateDead = "dead"
+	// NodeHostStateLeft indicates that memberlist has observed the nodehost
+	// leaving voluntarily.
+	NodeHostStateLeft = "left"
+)
+
 // NodeHostRegistry provides APIs for querying data shared between NodeHost
 // instances via gossip.
 type INodeHostRegistry interface {
 	NumOfShards() int
 	GetMeta(nhID string) ([]byte, bool)
+	GetNodeHostState(nhID string) (string, time.Time, bool)
 	GetShardInfo(shardID uint64) (ShardView, bool)
 }

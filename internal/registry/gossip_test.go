@@ -138,6 +138,10 @@ func TestGossipManagerCanBeCreatedAndStopped(t *testing.T) {
 	if addr != nhConfig.RaftAddress {
 		t.Errorf("unexpected raft address, %s, want %s", addr, nhConfig.RaftAddress)
 	}
+	state, _, ok := m.GetNodeHostRegistry().GetNodeHostState(nhid)
+	if !ok || state != nodeHostStateAlive {
+		t.Errorf("unexpected nodehost state %s, ok %t", state, ok)
+	}
 }
 
 func TestGossipManagerCanGossip(t *testing.T) {
@@ -197,6 +201,14 @@ func TestGossipManagerCanGossip(t *testing.T) {
 		}
 		addr, ok = m2.GetRaftAddress(nhid1)
 		if !ok || addr != nhConfig1.RaftAddress {
+			continue
+		}
+		state, _, ok := m1.GetNodeHostRegistry().GetNodeHostState(nhid2)
+		if !ok || state != nodeHostStateAlive {
+			continue
+		}
+		state, _, ok = m2.GetNodeHostRegistry().GetNodeHostState(nhid1)
+		if !ok || state != nodeHostStateAlive {
 			continue
 		}
 		return
