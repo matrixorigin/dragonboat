@@ -254,22 +254,29 @@ func (d *db) rebuildLog(logNum fileNum) (err error) {
 	// in theory, we should be able to just truncate the log file to the last
 	// reported offset. however, for simplicity, let's just copy the log and skip
 	// the last broken chunk or block.
+	//
+	// The copy replaces the original log only once it is complete and durable:
+	// every record copied, the writer finished, the file synced and closed. Any
+	// failure before that keeps the original log untouched, removes the copy
+	// and returns the error, so open can simply be retried. (open also removes
+	// a temporary log left behind by a crash during the copy.)
 	fn := makeFilename(d.opts.FS, d.dirname, fileTypeLogTemp, logNum)
 	ln := makeFilename(d.opts.FS, d.dirname, fileTypeLog, logNum)
 	f, err := d.opts.FS.Create(fn)
 	if err != nil {
 		return err
 	}
+	published := false
 	defer func() {
-		err = firstError(err, f.Sync())
-		err = firstError(err, f.Close())
-		err = firstError(err, d.opts.FS.Rename(fn, ln))
-		err = firstError(err, d.dataDir.Sync())
+		if published {
+			return
+		}
+		if f != nil {
+			_ = f.Close()
+		}
+		_ = d.opts.FS.Remove(fn)
 	}()
 	w := newWriter(f)
-	defer func() {
-		err = firstError(err, w.close())
-	}()
 	buf := make([]byte, defaultBufferSize)
 	var herr error
 	var newOffset int64
@@ -295,7 +302,25 @@ func (d *db) rebuildLog(logNum fileNum) (err error) {
 			return err
 		}
 	}
-	return herr
+	if herr != nil {
+		return herr
+	}
+	if err := w.close(); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	cerr := f.Close()
+	f = nil
+	if cerr != nil {
+		return cerr
+	}
+	if err := d.opts.FS.Rename(fn, ln); err != nil {
+		return err
+	}
+	published = true
+	return d.dataDir.Sync()
 }
 
 func (d *db) saveIndex() error {
