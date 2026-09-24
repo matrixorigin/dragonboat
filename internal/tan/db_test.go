@@ -915,3 +915,121 @@ func TestRebuildLogMidStreamCorruption(t *testing.T) {
 	_, err = open(1, 1, dirname, dirname, opts)
 	require.ErrorIs(t, err, ErrCRCMismatch)
 }
+
+// faultyTempLogFS injects failures into the temporary log rebuildLog writes,
+// and passes everything else through.
+type faultyTempLogFS struct {
+	vfs.FS
+	tempLog string
+	// writeLimit fails writes to the temporary log once this many bytes have
+	// been written (e.g. ENOSPC part-way through the copy); negative disables.
+	writeLimit int
+	failSync   bool
+}
+
+func (fs *faultyTempLogFS) Create(name string) (vfs.File, error) {
+	f, err := fs.FS.Create(name)
+	if err != nil || name != fs.tempLog {
+		return f, err
+	}
+	return &faultyFile{File: f, fs: fs}, nil
+}
+
+type faultyFile struct {
+	vfs.File
+	fs      *faultyTempLogFS
+	written int
+}
+
+func (f *faultyFile) Write(p []byte) (int, error) {
+	if limit := f.fs.writeLimit; limit >= 0 && f.written+len(p) > limit {
+		n, _ := f.File.Write(p[:limit-f.written])
+		f.written += n
+		return n, vfs.ErrInjected
+	}
+	n, err := f.File.Write(p)
+	f.written += n
+	return n, err
+}
+
+func (f *faultyFile) Sync() error {
+	if f.fs.failSync {
+		return vfs.ErrInjected
+	}
+	return f.File.Sync()
+}
+
+// Review: rebuildLog must publish the copied log only after the copy is
+// complete and durable.  A write or sync failure while repairing a torn tail
+// must leave the original log byte-for-byte intact, leave no temporary log,
+// and let a retried open recover.
+func TestRebuildLogFailureKeepsOriginal(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		writeLimit int
+		failSync   bool
+	}{
+		{"write fails at once", 0, false},
+		{"write fails part-way", 100, false},
+		{"sync fails", -1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer leaktest.AfterTest(t)()
+			fs := vfs.Default
+			defer vfs.ReportLeakedFD(fs, t)
+			opts := &Options{MaxManifestFileSize: MaxManifestFileSize, FS: fs}
+			dirname := "db-dir-rebuild-fault"
+			require.NoError(t, fs.RemoveAll(dirname))
+			require.NoError(t, fs.MkdirAll(dirname, 0700))
+			defer func() {
+				require.NoError(t, fs.RemoveAll(dirname))
+			}()
+			db, err := open(1, 1, dirname, dirname, opts)
+			require.NoError(t, err)
+			buf := make([]byte, 1024)
+			for i := uint64(1); i <= uint64(20); i++ {
+				u := pb.Update{
+					ShardID:       2,
+					ReplicaID:     3,
+					EntriesToSave: []pb.Entry{{Index: i, Term: 5, Cmd: make([]byte, 32)}},
+				}
+				_, err := db.write(u, buf)
+				require.NoError(t, err)
+			}
+			logNum := db.mu.logNum
+			require.NoError(t, db.close())
+			logFn := makeFilename(fs, dirname, fileTypeLog, logNum)
+			tmpFn := makeFilename(fs, dirname, fileTypeLogTemp, logNum)
+			// A torn tail, so open repairs the log through rebuildLog.
+			lf, err := os.OpenFile(logFn, os.O_RDWR, 0755)
+			require.NoError(t, err)
+			fi, err := lf.Stat()
+			require.NoError(t, err)
+			_, err = lf.WriteAt(make([]byte, 16), fi.Size()-16)
+			require.NoError(t, err)
+			require.NoError(t, lf.Close())
+			require.NoError(t, fs.RemoveAll(makeFilename(fs, dirname, fileTypeIndex, logNum)))
+			original, err := os.ReadFile(logFn)
+			require.NoError(t, err)
+
+			faulty := &faultyTempLogFS{FS: fs, tempLog: tmpFn, writeLimit: tc.writeLimit, failSync: tc.failSync}
+			_, err = open(1, 1, dirname, dirname, &Options{MaxManifestFileSize: MaxManifestFileSize, FS: faulty})
+			require.ErrorIs(t, err, vfs.ErrInjected)
+
+			after, err := os.ReadFile(logFn)
+			require.NoError(t, err)
+			require.Equal(t, original, after, "the original log survives a failed repair")
+			_, err = os.Stat(tmpFn)
+			require.True(t, os.IsNotExist(err), "the partial copy is removed")
+
+			// Retry with a healthy file system: the repair completes.
+			db, err = open(1, 1, dirname, dirname, opts)
+			require.NoError(t, err)
+			var result []pb.Entry
+			result, _, err = db.getEntries(2, 3, result, 0, 1, 21, math.MaxUint64)
+			require.NoError(t, err)
+			require.Equal(t, 19, len(result))
+			require.NoError(t, db.close())
+		})
+	}
+}
