@@ -262,7 +262,16 @@ func (r *reader) nextChunk(wantFirst bool) error {
 					r.recover()
 					continue
 				}
-				return ErrCRCMismatch
+				// A chunk that fails its checksum with nothing valid after it is
+				// the torn tail a crash leaves (the chunk's header reached disk
+				// but the end of its payload did not): report it as invalid so
+				// recovery drops it, as it does a truncated tail.  If a valid
+				// chunk follows, the log is corrupt in the middle, and dropping
+				// everything after it would lose records that were durable.
+				if r.validChunkFollows() {
+					return ErrCRCMismatch
+				}
+				return ErrInvalidChunk
 			}
 			if wantFirst {
 				if chunkType != fullChunkType && chunkType != firstChunkType {
@@ -292,6 +301,74 @@ func (r *reader) nextChunk(wantFirst bool) error {
 		r.begin, r.end, r.n = 0, 0, n
 		r.blockNum++
 	}
+}
+
+// validChunkFollows reports whether any chunk after the current one, in the
+// rest of the current block or in any later block, has a valid header and
+// checksum.  It is called only on a checksum mismatch.  The underlying reader
+// is left where it was, so a caller that recovers resumes at the next block as
+// before.  A reader that cannot seek cannot be read ahead without buffering the
+// rest of the log, so the answer is the conservative one: something may follow.
+func (r *reader) validChunkFollows() (follows bool) {
+	if r.end <= r.n && r.validChunkIn(r.buf[:r.n], r.end) {
+		return true
+	}
+	seeker, ok := r.r.(io.Seeker)
+	if !ok {
+		return true
+	}
+	pos, err := seeker.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return true
+	}
+	defer func() {
+		// If the position cannot be restored, a repair would read from the
+		// wrong place: keep the mismatch fatal instead.
+		if _, err := seeker.Seek(pos, io.SeekStart); err != nil {
+			follows = true
+		}
+	}()
+	var block [blockSize]byte
+	for {
+		n, err := io.ReadFull(r.r, block[:])
+		if n > 0 && r.validChunkIn(block[:n], 0) {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
+
+// validChunkIn walks the chunks of one block from offset off and reports
+// whether one of them validates.  It stops at the first chunk it cannot
+// delimit: a zeroed header (padding or preallocation), a length past the
+// block, a chunk of an earlier incarnation of the log, or a bad checksum.
+func (r *reader) validChunkIn(buf []byte, off int) bool {
+	for off+legacyHeaderSize <= len(buf) {
+		checksum := binary.LittleEndian.Uint32(buf[off : off+4])
+		length := int(binary.LittleEndian.Uint16(buf[off+4 : off+6]))
+		chunkType := buf[off+6]
+		if checksum == 0 && length == 0 && chunkType == 0 {
+			return false
+		}
+		headerSize := legacyHeaderSize
+		if chunkType >= recyclableFullChunkType && chunkType <= recyclableLastChunkType {
+			headerSize = recyclableHeaderSize
+			if off+headerSize > len(buf) ||
+				binary.LittleEndian.Uint32(buf[off+7:off+11]) != r.logNum {
+				return false
+			}
+		} else if chunkType < fullChunkType || chunkType > lastChunkType {
+			return false
+		}
+		end := off + headerSize + length
+		if end > len(buf) || checksum != getCRC(buf[off+6:end]) {
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // next returns a reader for the next record. It returns io.EOF if there are no

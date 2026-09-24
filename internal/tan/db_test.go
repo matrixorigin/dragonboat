@@ -802,3 +802,116 @@ func TestLoadArchivedNodeStates(t *testing.T) {
 	}
 	runTanTest(t, opts, tf2, fs)
 }
+
+// TestRebuildLogTornTail covers the other shape a crash leaves at the tail of
+// the last log: the final chunk's header reached disk but the end of its
+// payload did not, so the file keeps its length and the chunk fails its
+// checksum.  Like a truncated tail, the torn record must be dropped on open.
+func TestRebuildLogTornTail(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	fs := vfs.Default
+	defer vfs.ReportLeakedFD(fs, t)
+	opts := &Options{
+		MaxManifestFileSize: MaxManifestFileSize,
+		FS:                  fs,
+	}
+	dirname := "db-dir-torn"
+	require.NoError(t, fs.RemoveAll(dirname))
+	require.NoError(t, fs.MkdirAll(dirname, 0700))
+	defer func() {
+		require.NoError(t, fs.RemoveAll(dirname))
+	}()
+	db, err := open(1, 1, dirname, dirname, opts)
+	require.NoError(t, err)
+	buf := make([]byte, 1024)
+	for i := uint64(1); i <= uint64(20); i++ {
+		u := pb.Update{
+			ShardID:   2,
+			ReplicaID: 3,
+			EntriesToSave: []pb.Entry{
+				{Index: i, Term: 5, Cmd: make([]byte, 32)},
+			},
+		}
+		_, err := db.write(u, buf)
+		require.NoError(t, err)
+	}
+	logNum := db.mu.logNum
+	require.NoError(t, db.close())
+	logFn := makeFilename(fs, dirname, fileTypeLog, logNum)
+	idxFn := makeFilename(fs, dirname, fileTypeIndex, logNum)
+	lf, err := os.OpenFile(logFn, os.O_RDWR, 0755)
+	require.NoError(t, err)
+	fi, err := lf.Stat()
+	require.NoError(t, err)
+	// Lose the last 16 bytes of the final record without shortening the file:
+	// they read back as zeroes, as unwritten pages of a preallocated or
+	// size-extended file do after a crash.
+	_, err = lf.WriteAt(make([]byte, 16), fi.Size()-16)
+	require.NoError(t, err)
+	require.NoError(t, lf.Close())
+	require.NoError(t, fs.RemoveAll(idxFn))
+
+	db, err = open(1, 1, dirname, dirname, opts)
+	require.NoError(t, err)
+	var result []pb.Entry
+	result, _, err = db.getEntries(2, 3, result, 0, 1, 21, math.MaxUint64)
+	require.NoError(t, err)
+	require.Equal(t, 19, len(result))
+	require.Equal(t, uint64(19), result[len(result)-1].Index)
+	require.NoError(t, db.close())
+}
+
+// TestRebuildLogMidStreamCorruption is the counterpart of the torn tail: a
+// record in the middle of the last log fails its checksum while the records
+// after it are intact.  That is corruption, not a crash tail, and open must
+// refuse rather than drop the durable records that follow.
+func TestRebuildLogMidStreamCorruption(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	fs := vfs.Default
+	defer vfs.ReportLeakedFD(fs, t)
+	opts := &Options{
+		MaxManifestFileSize: MaxManifestFileSize,
+		FS:                  fs,
+	}
+	dirname := "db-dir-midstream"
+	require.NoError(t, fs.RemoveAll(dirname))
+	require.NoError(t, fs.MkdirAll(dirname, 0700))
+	defer func() {
+		require.NoError(t, fs.RemoveAll(dirname))
+	}()
+	db, err := open(1, 1, dirname, dirname, opts)
+	require.NoError(t, err)
+	buf := make([]byte, 1024)
+	for i := uint64(1); i <= uint64(20); i++ {
+		u := pb.Update{
+			ShardID:   2,
+			ReplicaID: 3,
+			EntriesToSave: []pb.Entry{
+				{Index: i, Term: 5, Cmd: make([]byte, 32)},
+			},
+		}
+		_, err := db.write(u, buf)
+		require.NoError(t, err)
+	}
+	logNum := db.mu.logNum
+	require.NoError(t, db.close())
+	logFn := makeFilename(fs, dirname, fileTypeLog, logNum)
+	idxFn := makeFilename(fs, dirname, fileTypeIndex, logNum)
+	lf, err := os.OpenFile(logFn, os.O_RDWR, 0755)
+	require.NoError(t, err)
+	fi, err := lf.Stat()
+	require.NoError(t, err)
+	// The 20 records are the same size; flip the last payload byte of the 10th.
+	pos := fi.Size()*10/20 - 1
+	b := make([]byte, 1)
+	_, err = lf.ReadAt(b, pos)
+	require.NoError(t, err)
+	b[0] ^= 0xff
+	_, err = lf.WriteAt(b, pos)
+	require.NoError(t, err)
+	require.NoError(t, lf.Close())
+	require.NoError(t, fs.RemoveAll(idxFn))
+
+	_, err = open(1, 1, dirname, dirname, opts)
+	require.ErrorIs(t, err, ErrCRCMismatch)
+}

@@ -807,3 +807,103 @@ func TestSize(t *testing.T) {
 	}
 	require.NoError(t, w.close())
 }
+
+// writeTestLog writes the given records with the log writer and returns the
+// encoded bytes and the offset at which each record starts.
+func writeTestLog(t *testing.T, records ...[]byte) ([]byte, []int64) {
+	buf := new(bytes.Buffer)
+	w := newWriter(buf)
+	offsets := make([]int64, 0, len(records))
+	var off int64
+	for _, rec := range records {
+		offsets = append(offsets, off)
+		next, err := w.writeRecord(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		off = next
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes(), offsets
+}
+
+// readAllRecords reads records until the first error and returns how many
+// were read and the error that stopped the reader (nil at a clean EOF).
+func readAllRecords(data []byte) (int, error) {
+	r := newReader(bytes.NewReader(data), 0)
+	n := 0
+	for {
+		rec, err := r.next()
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+		if _, err := io.ReadAll(rec); err != nil {
+			return n, err
+		}
+		n++
+	}
+}
+
+// A checksum failure is a torn tail only when nothing valid follows it: the
+// torn tail is an invalid record, which recovery drops, while corruption with
+// intact data after it stays ErrCRCMismatch and is never silently dropped.
+func TestCRCMismatchTornTailVersusMidStream(t *testing.T) {
+	small := func(b byte) []byte { return bytes.Repeat([]byte{b}, 100) }
+	big := bytes.Repeat([]byte{'x'}, 3*blockSize) // spans blocks
+
+	for _, tc := range []struct {
+		name    string
+		records [][]byte
+		corrupt int // record whose last payload byte is flipped
+		wantN   int
+		tail    bool
+	}{
+		{"last small record", [][]byte{small('a'), small('b'), small('c')}, 2, 2, true},
+		{"middle small record", [][]byte{small('a'), small('b'), small('c')}, 1, 1, false},
+		{"first record, later ones intact", [][]byte{small('a'), small('b')}, 0, 0, false},
+		{"record before a multi-block record", [][]byte{small('a'), small('b'), big}, 1, 1, false},
+		{"last record spanning blocks", [][]byte{small('a'), big}, 1, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, offsets := writeTestLog(t, tc.records...)
+			// The last byte of the corrupted record's final chunk: just
+			// before the next record, or the end of the log for the last one.
+			end := int64(len(data))
+			if tc.corrupt+1 < len(offsets) {
+				end = offsets[tc.corrupt+1]
+			}
+			for end > 0 && data[end-1] == 0 && tc.corrupt+1 < len(offsets) {
+				end-- // skip block padding before the next record
+			}
+			data[end-1] ^= 0xff
+
+			n, err := readAllRecords(data)
+			if n != tc.wantN {
+				t.Fatalf("read %d records, want %d (err %v)", n, tc.wantN, err)
+			}
+			if tc.tail {
+				if !IsInvalidRecord(err) {
+					t.Fatalf("torn tail must be an invalid record, got %v", err)
+				}
+			} else if !errors.Is(err, ErrCRCMismatch) {
+				t.Fatalf("mid-stream corruption must stay ErrCRCMismatch, got %v", err)
+			}
+		})
+	}
+}
+
+// Zeroes after the torn chunk, as preallocation leaves, are still a tail.
+func TestCRCMismatchTornTailBeforeZeroes(t *testing.T) {
+	data, _ := writeTestLog(t, []byte("first record"), []byte("second record"))
+	data[len(data)-1] ^= 0xff
+	data = append(data, make([]byte, 2*blockSize)...)
+	n, err := readAllRecords(data)
+	if n != 1 || !IsInvalidRecord(err) {
+		t.Fatalf("read %d records, err %v; want 1 and an invalid record", n, err)
+	}
+}
