@@ -6,6 +6,7 @@ package tan
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -806,4 +807,198 @@ func TestSize(t *testing.T) {
 		}
 	}
 	require.NoError(t, w.close())
+}
+
+// writeTestLog writes the given records with the log writer and returns the
+// encoded bytes and the offset at which each record starts.
+func writeTestLog(t *testing.T, records ...[]byte) ([]byte, []int64) {
+	buf := new(bytes.Buffer)
+	w := newWriter(buf)
+	offsets := make([]int64, 0, len(records))
+	var off int64
+	for _, rec := range records {
+		offsets = append(offsets, off)
+		next, err := w.writeRecord(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		off = next
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes(), offsets
+}
+
+// readAllRecords reads records until the first error and returns how many
+// were read and the error that stopped the reader (nil at a clean EOF).
+func readAllRecords(data []byte) (int, error) {
+	r := newReader(bytes.NewReader(data), 0)
+	n := 0
+	for {
+		rec, err := r.next()
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+		if _, err := io.ReadAll(rec); err != nil {
+			return n, err
+		}
+		n++
+	}
+}
+
+// A checksum failure is a torn tail only when nothing valid follows it: the
+// torn tail is an invalid record, which recovery drops, while corruption with
+// intact data after it stays ErrCRCMismatch and is never silently dropped.
+func TestCRCMismatchTornTailVersusMidStream(t *testing.T) {
+	small := func(b byte) []byte { return bytes.Repeat([]byte{b}, 100) }
+	big := bytes.Repeat([]byte{'x'}, 3*blockSize) // spans blocks
+
+	for _, tc := range []struct {
+		name    string
+		records [][]byte
+		corrupt int // record whose last payload byte is flipped
+		wantN   int
+		tail    bool
+	}{
+		{"last small record", [][]byte{small('a'), small('b'), small('c')}, 2, 2, true},
+		{"middle small record", [][]byte{small('a'), small('b'), small('c')}, 1, 1, false},
+		{"first record, later ones intact", [][]byte{small('a'), small('b')}, 0, 0, false},
+		{"record before a multi-block record", [][]byte{small('a'), small('b'), big}, 1, 1, false},
+		{"last record spanning blocks", [][]byte{small('a'), big}, 1, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, offsets := writeTestLog(t, tc.records...)
+			// The last byte of the corrupted record's final chunk: just
+			// before the next record, or the end of the log for the last one.
+			end := int64(len(data))
+			if tc.corrupt+1 < len(offsets) {
+				end = offsets[tc.corrupt+1]
+			}
+			for end > 0 && data[end-1] == 0 && tc.corrupt+1 < len(offsets) {
+				end-- // skip block padding before the next record
+			}
+			data[end-1] ^= 0xff
+
+			n, err := readAllRecords(data)
+			if n != tc.wantN {
+				t.Fatalf("read %d records, want %d (err %v)", n, tc.wantN, err)
+			}
+			if tc.tail {
+				if !IsInvalidRecord(err) {
+					t.Fatalf("torn tail must be an invalid record, got %v", err)
+				}
+			} else if !errors.Is(err, ErrCRCMismatch) {
+				t.Fatalf("mid-stream corruption must stay ErrCRCMismatch, got %v", err)
+			}
+		})
+	}
+}
+
+// Zeroes after the torn chunk, as preallocation leaves, are still a tail.
+func TestCRCMismatchTornTailBeforeZeroes(t *testing.T) {
+	data, _ := writeTestLog(t, []byte("first record"), []byte("second record"))
+	data[len(data)-1] ^= 0xff
+	data = append(data, make([]byte, 2*blockSize)...)
+	n, err := readAllRecords(data)
+	if n != 1 || !IsInvalidRecord(err) {
+		t.Fatalf("read %d records, err %v; want 1 and an invalid record", n, err)
+	}
+}
+
+// Review: the failed chunk's length cannot be trusted to find the next chunk.
+// With the first of three short records' length changed from 5 to 6, the
+// checksum fails and the look-ahead must still see the two intact records
+// after it, keeping the failure fatal instead of dropping them as a tail.
+func TestCRCMismatchCorruptLengthStillFatal(t *testing.T) {
+	data, _ := writeTestLog(t, []byte("hello"), []byte("world"), []byte("again"))
+	require.Equal(t, uint16(5), binary.LittleEndian.Uint16(data[4:6]))
+	binary.LittleEndian.PutUint16(data[4:6], 6)
+	n, err := readAllRecords(data)
+	require.Equal(t, 0, n)
+	require.ErrorIs(t, err, ErrCRCMismatch)
+}
+
+// A length running past the block is a truncated tail only when nothing valid
+// follows; with intact records after it, it is corruption and stays fatal.
+func TestCorruptLengthPastBlockStillFatal(t *testing.T) {
+	data, _ := writeTestLog(t, []byte("hello"), []byte("world"), []byte("again"))
+	binary.LittleEndian.PutUint16(data[4:6], 0xffff)
+	n, err := readAllRecords(data)
+	require.Equal(t, 0, n)
+	require.ErrorIs(t, err, ErrCorruptChunk)
+	require.False(t, IsInvalidRecord(err))
+
+	// The same length at the real end of the log is a truncated tail.
+	tail, _ := writeTestLog(t, []byte("hello"), []byte("world"))
+	binary.LittleEndian.PutUint16(tail[len(tail)-12+4:], 0xffff)
+	n, err = readAllRecords(tail)
+	require.Equal(t, 1, n)
+	require.True(t, IsInvalidRecord(err), "%v", err)
+}
+
+// failingReadSeeker returns errFailedRead for any read at or past failAt.
+type failingReadSeeker struct {
+	*bytes.Reader
+	failAt int64
+}
+
+var errFailedRead = errors.New("injected read failure")
+
+func (f *failingReadSeeker) Read(p []byte) (int, error) {
+	pos, _ := f.Reader.Seek(0, io.SeekCurrent)
+	if pos >= f.failAt {
+		return 0, errFailedRead
+	}
+	return f.Reader.Read(p)
+}
+
+// Review: a read error during the look-ahead is not proof that nothing
+// follows, so the checksum failure stays fatal.
+func TestCRCMismatchLookAheadReadErrorStillFatal(t *testing.T) {
+	// Block 0 holds exactly rec0 and rec1; rec2 starts block 1.
+	rec0 := bytes.Repeat([]byte{'a'}, blockSize-2*legacyHeaderSize-5)
+	build := func(withRec2 bool) []byte {
+		records := [][]byte{rec0, []byte("bbbbb")}
+		if withRec2 {
+			records = append(records, []byte("ccccc"))
+		}
+		data, offsets := writeTestLog(t, records...)
+		require.Equal(t, int64(blockSize-legacyHeaderSize-5), offsets[1])
+		data[blockSize-1] ^= 0xff // rec1's last payload byte
+		return data
+	}
+	read := func(rs io.ReadSeeker) (int, error) {
+		r := newReader(rs, 0)
+		n := 0
+		for {
+			rec, err := r.next()
+			if err == io.EOF {
+				return n, nil
+			}
+			if err != nil {
+				return n, err
+			}
+			if _, err := io.ReadAll(rec); err != nil {
+				return n, err
+			}
+			n++
+		}
+	}
+
+	data := build(true)
+	n, err := read(&failingReadSeeker{Reader: bytes.NewReader(data), failAt: blockSize})
+	require.Equal(t, 1, n)
+	require.ErrorIs(t, err, ErrCRCMismatch, "a failed read-ahead keeps the mismatch fatal")
+
+	n, err = read(bytes.NewReader(data))
+	require.Equal(t, 1, n)
+	require.ErrorIs(t, err, ErrCRCMismatch, "the valid record in block 1 is found")
+
+	n, err = read(bytes.NewReader(build(false)))
+	require.Equal(t, 1, n)
+	require.True(t, IsInvalidRecord(err), "nothing follows: a torn tail, %v", err)
 }

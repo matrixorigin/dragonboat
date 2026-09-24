@@ -145,6 +145,10 @@ var (
 	ErrInvalidChunk = errors.New("invalid chunk")
 	// ErrCRCMismatch is returned to indicate that CRC mismatch has been found.
 	ErrCRCMismatch = errors.New("tan: crc mismatch")
+	// ErrCorruptChunk is returned when a chunk's length runs past its block
+	// while valid chunks follow it: the log is corrupt in the middle, not
+	// torn at the tail.
+	ErrCorruptChunk = errors.New("tan: corrupt chunk")
 )
 
 // IsInvalidRecord returns true if the error matches one of the error types
@@ -203,6 +207,7 @@ func newReader(r io.Reader, logNum fileNum) *reader {
 func (r *reader) nextChunk(wantFirst bool) error {
 	for {
 		if r.end+legacyHeaderSize <= r.n {
+			start := r.end // the chunk header's offset in buf
 			checksum := binary.LittleEndian.Uint32(r.buf[r.end+0 : r.end+4])
 			length := binary.LittleEndian.Uint16(r.buf[r.end+4 : r.end+6])
 			chunkType := r.buf[r.end+6]
@@ -255,6 +260,11 @@ func (r *reader) nextChunk(wantFirst bool) error {
 					r.recover()
 					continue
 				}
+				// A chunk running past the data read is a truncated tail
+				// only if nothing valid follows it; see validChunkFollows.
+				if r.validChunkFollows(start) {
+					return ErrCorruptChunk
+				}
 				return ErrInvalidChunk
 			}
 			if checksum != getCRC(r.buf[r.begin-headerSize+6:r.end]) {
@@ -262,7 +272,16 @@ func (r *reader) nextChunk(wantFirst bool) error {
 					r.recover()
 					continue
 				}
-				return ErrCRCMismatch
+				// A chunk that fails its checksum with nothing valid after it is
+				// the torn tail a crash leaves (the chunk's header reached disk
+				// but the end of its payload did not): report it as invalid so
+				// recovery drops it, as it does a truncated tail.  If a valid
+				// chunk follows, the log is corrupt in the middle, and dropping
+				// everything after it would lose records that were durable.
+				if r.validChunkFollows(start) {
+					return ErrCRCMismatch
+				}
+				return ErrInvalidChunk
 			}
 			if wantFirst {
 				if chunkType != fullChunkType && chunkType != firstChunkType {
@@ -292,6 +311,88 @@ func (r *reader) nextChunk(wantFirst bool) error {
 		r.begin, r.end, r.n = 0, 0, n
 		r.blockNum++
 	}
+}
+
+// validChunkFollows reports whether a valid chunk exists anywhere after the
+// chunk whose header starts at buf offset start, which failed to validate.
+// The failed header's length cannot be trusted to locate the next chunk, so
+// every offset after the header's first byte is tried, in the rest of the
+// current block and in every later block, not only chunk boundaries.
+//
+// It errs towards true, which keeps the failure fatal: only reaching the end
+// of the log proves that nothing follows.  A read error, a reader that cannot
+// seek, or a position that cannot be restored all answer true.  The reader is
+// left where it was, so a caller that recovers resumes at the next block.
+func (r *reader) validChunkFollows(start int) (follows bool) {
+	if r.validChunkFrom(r.buf[:r.n], start+1) {
+		return true
+	}
+	seeker, ok := r.r.(io.Seeker)
+	if !ok {
+		return true
+	}
+	pos, err := seeker.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return true
+	}
+	defer func() {
+		// If the position cannot be restored, a repair would read from the
+		// wrong place: keep the failure fatal instead.
+		if _, err := seeker.Seek(pos, io.SeekStart); err != nil {
+			follows = true
+		}
+	}()
+	var block [blockSize]byte
+	for {
+		n, err := io.ReadFull(r.r, block[:])
+		if n > 0 && r.validChunkFrom(block[:n], 0) {
+			return true
+		}
+		switch err {
+		case nil:
+		case io.EOF, io.ErrUnexpectedEOF:
+			return false
+		default:
+			return true
+		}
+	}
+}
+
+// validChunkFrom reports whether a valid chunk starts at any offset of buf at
+// or after from.  Zeroes and garbage are rejected by the type check before any
+// checksum is computed; a false match would need a random 32-bit checksum to
+// agree, and would only keep a failure fatal.
+func (r *reader) validChunkFrom(buf []byte, from int) bool {
+	for off := from; off+legacyHeaderSize <= len(buf); off++ {
+		if r.validChunkAt(buf, off) {
+			return true
+		}
+	}
+	return false
+}
+
+// validChunkAt reports whether a chunk with a known type, a length inside buf
+// and a matching checksum (and, for recyclable chunks, this log's number)
+// starts at off.
+func (r *reader) validChunkAt(buf []byte, off int) bool {
+	chunkType := buf[off+6]
+	headerSize := legacyHeaderSize
+	switch {
+	case chunkType >= fullChunkType && chunkType <= lastChunkType:
+	case chunkType >= recyclableFullChunkType && chunkType <= recyclableLastChunkType:
+		headerSize = recyclableHeaderSize
+		if off+headerSize > len(buf) ||
+			binary.LittleEndian.Uint32(buf[off+7:off+11]) != r.logNum {
+			return false
+		}
+	default:
+		return false
+	}
+	end := off + headerSize + int(binary.LittleEndian.Uint16(buf[off+4:off+6]))
+	if end > len(buf) {
+		return false
+	}
+	return binary.LittleEndian.Uint32(buf[off:off+4]) == getCRC(buf[off+6:end])
 }
 
 // next returns a reader for the next record. It returns io.EOF if there are no
