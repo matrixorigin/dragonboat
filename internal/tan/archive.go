@@ -63,16 +63,37 @@ func (d *db) startArchiver() {
 			}
 
 		case <-gcTicker.C:
-			d.archiver.gc(time.Now().Add(-gcThreshold), false)
+			d.gcArchive(time.Now().Add(-gcThreshold))
 
 		case <-haTicker.C:
 			d.archiver.backup()
 
 		case <-gcFailRetryTicker.C:
-			// start a async job to delete files.
-			go d.archiver.gcFailedRetry()
+			d.stopper.RunWorker(d.archiver.gcFailedRetry)
 		}
 	}
+}
+
+// gcArchive admits storage preparation and remote deletion as one database job.
+func (d *db) gcArchive(gcTS time.Time) {
+	d.stopper.RunWorker(func() {
+		files := d.archiver.gc(gcTS)
+		if len(files) == 0 || d.archiver.ArchiveIO == nil {
+			return
+		}
+		defer func() {
+			if len(files) != 0 {
+				d.archiver.mu.Lock()
+				d.archiver.mu.gcFailedQueue = append(d.archiver.mu.gcFailedQueue, files...)
+				d.archiver.mu.Unlock()
+			}
+		}()
+		if err := d.archiver.Delete(d.archiver.ctx, d.archiver.subDir, files...); err != nil {
+			plog.Errorf("failed to delete log/index file from remote: %v", err)
+			return
+		}
+		files = nil
+	})
 }
 
 type archiver struct {
@@ -127,10 +148,18 @@ func (a *archiver) gcFailedRetry() {
 		return
 	}
 	a.mu.Lock()
-	files := a.mu.gcFailedQueue[:]
-	a.mu.gcFailedQueue = a.mu.gcFailedQueue[:0]
+	files := a.mu.gcFailedQueue
+	a.mu.gcFailedQueue = nil
 	a.mu.Unlock()
-	for _, f := range files {
+	defer func() {
+		if len(files) > 0 {
+			a.mu.Lock()
+			a.mu.gcFailedQueue = append(a.mu.gcFailedQueue, files...)
+			a.mu.Unlock()
+		}
+	}()
+	for len(files) > 0 {
+		f := files[0]
 		if err := a.Delete(a.ctx, a.subDir, f); err != nil {
 			plog.Errorf("failed to delete log/index file from remote in retry, file: %s, err: %v",
 				f, err)
@@ -138,10 +167,12 @@ func (a *archiver) gcFailedRetry() {
 			a.mu.gcFailedQueue = append(a.mu.gcFailedQueue, f)
 			a.mu.Unlock()
 		}
+		files = files[1:]
 	}
 }
 
-func (a *archiver) gc(gcTS time.Time, sync bool) {
+func (a *archiver) gc(gcTS time.Time) []string {
+	var files []string
 	if err := a.recorder.withFile(typeRead, func() error {
 		// count is the number of items we should remove from the ARCHIVE file
 		// from the beginning.
@@ -169,14 +200,19 @@ func (a *archiver) gc(gcTS time.Time, sync bool) {
 					return err
 				}
 			}
-			tf, err := a.recorder.fs.Create(tmpFilePath)
+			err = func() (err error) {
+				tf, err := a.recorder.fs.Create(tmpFilePath)
+				if err != nil {
+					return err
+				}
+				defer func() { err = errors.Join(err, tf.Close()) }()
+				if _, err := io.Copy(tf, a.recorder.mu.file); err != nil {
+					return err
+				}
+				return tf.Sync()
+			}()
 			if err != nil {
-				plog.Errorf("failed to create tmp ARCHIVE file: %v", err)
-				return err
-			}
-			_, err = io.Copy(tf, a.recorder.mu.file)
-			if err != nil {
-				plog.Errorf("failed to copy tmp ARCHIVE file: %v", err)
+				plog.Errorf("failed to prepare tmp ARCHIVE file: %v", err)
 				return err
 			}
 			if err := a.recorder.fs.Rename(tmpFilePath, a.recorder.filePath); err != nil {
@@ -184,7 +220,7 @@ func (a *archiver) gc(gcTS time.Time, sync bool) {
 				return err
 			}
 
-			files := make([]string, 0, len(fileNums))
+			files = make([]string, 0, len(fileNums)*2)
 			for _, num := range fileNums {
 				files = append(files,
 					makeFilename(a.recorder.fs, a.recorder.dirname, fileTypeLog, fileNum(num)),
@@ -192,29 +228,12 @@ func (a *archiver) gc(gcTS time.Time, sync bool) {
 				)
 			}
 
-			if a.ArchiveIO != nil {
-				if sync {
-					if err := a.Delete(a.ctx, a.subDir, files...); err != nil {
-						plog.Errorf("failed to delete log/index file from remote: %v", err)
-						a.mu.gcFailedQueue = append(a.mu.gcFailedQueue, files...)
-					}
-				} else {
-					go func() {
-						if err := a.Delete(a.ctx, a.subDir, files...); err != nil {
-							plog.Errorf("failed to delete log/index file from remote: %v", err)
-							a.mu.Lock()
-							a.mu.gcFailedQueue = append(a.mu.gcFailedQueue, files...)
-							a.mu.Unlock()
-						}
-					}()
-				}
-			}
 		}
 		return nil
 	}); err != nil {
 		plog.Errorf("failed to do GC operation: %v", err)
-		return
 	}
+	return files
 }
 
 func (a *archiver) backup() {
@@ -269,20 +288,9 @@ func (r *recorder) ensureDir() {
 	}
 }
 
-func (r *recorder) withFile(typ fileOpenType, fn func() error) error {
-	closeFn, err := r._ensureFile(typ)
-	if err != nil {
-		return err
-	}
-	defer closeFn()
-	return fn()
-}
-
-// _ensureFile ensures the ARCHIVE file is opened correctly. Do not call it
-// directly, instead, call it in withFile() method.
-func (r *recorder) _ensureFile(typ fileOpenType) (func(), error) {
+func (r *recorder) withFile(typ fileOpenType, fn func() error) (err error) {
 	r.mu.Lock()
-	var err error
+	defer r.mu.Unlock()
 	if typ == typeRead {
 		r.mu.file, err = r.fs.Open(r.filePath)
 	} else {
@@ -292,21 +300,28 @@ func (r *recorder) _ensureFile(typ fileOpenType) (func(), error) {
 		var pathError *os.PathError
 		if errors.As(err, &pathError) {
 			if err := r.fs.MkdirAll(r.dirname, 0666); err != nil {
-				return nil, err
+				return err
 			}
 			r.mu.file, err = r.fs.Create(r.filePath)
 			if err != nil {
-				return nil, err
+				return err
 			}
 		} else {
-			return nil, err
+			return err
 		}
 	}
-	return func() {
-		_ = r.mu.file.Close()
+	defer func() {
+		cleanupErr := r.mu.file.Close()
 		r.mu.file = nil
-		r.mu.Unlock()
-	}, nil
+		if cleanupErr != nil {
+			if err != nil {
+				err = errors.Join(err, cleanupErr)
+			} else {
+				err = cleanupErr
+			}
+		}
+	}()
+	return fn()
 }
 
 func (r *recorder) size() (int64, error) {

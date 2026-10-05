@@ -47,3 +47,5 @@ require (
 )
 
 go 1.24.0
+
+replace github.com/lni/goutils => github.com/matrixorigin/goutils v1.3.1-0.20261005222446-b0121fc3bcd6

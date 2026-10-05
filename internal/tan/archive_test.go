@@ -257,30 +257,24 @@ func TestSearchByLsn(t *testing.T) {
 }
 
 func TestGC(t *testing.T) {
-	archiveDir := t.TempDir()
-	fs := vfs.NewMem()
-	r := newArchiveRecorder(archiveDir, fs)
-	count := 20
-	now := time.Now()
-	for i := 0; i < count; i++ {
-		item := config.RecordItem{
-			FileNum:  uint64(i + 1),
-			TS:       now.Add(time.Second * time.Duration(i) * 5),
-			FirstLsn: uint64(i*50) + 10,
-		}
-		assert.NoError(t, r.append(item))
+	fs := vfs.NewStrictMem()
+	t.Cleanup(func() { vfs.ReportLeakedFD(fs, t) })
+	r := newArchiveRecorder("/archive-gc", fs)
+	now := time.Unix(100, 0)
+	for i := 0; i < 4; i++ {
+		assert.NoError(t, r.append(config.RecordItem{
+			FileNum: uint64(i + 1), TS: now.Add(time.Second * time.Duration(i) * 5), FirstLsn: uint64(i*50) + 10,
+		}))
 	}
-	aio := newMockArchiveIO(fs, archiveDir)
-	assert.NoError(t, aio.init())
-	defer func() {
-		assert.NoError(t, aio.clean())
-	}()
-	a := newArchiver(context.Background(), aio, archiveDir, fs)
-	a.gc(now.Add(time.Second*13), true)
-
+	a := &archiver{recorder: r}
+	assert.Equal(t, []string{
+		"/archive-gc/000001.log", "/archive-gc/000001.index",
+		"/archive-gc/000002.log", "/archive-gc/000002.index",
+		"/archive-gc/000003.log", "/archive-gc/000003.index",
+	}, a.gc(now.Add(time.Second*13)))
 	sz, err := r.size()
 	assert.NoError(t, err)
-	assert.Equal(t, int64(408), sz)
+	assert.Equal(t, int64(24), sz)
 }
 
 func TestGCFailedRetry(t *testing.T) {
