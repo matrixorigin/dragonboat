@@ -292,7 +292,8 @@ func (t *Transport) SetPreStreamChunkSendHook(h StreamChunkSendFunc) {
 func (t *Transport) Close() error {
 	t.cancel()
 	t.stopper.Stop()
-	t.chunks.Close()
+	// Stop and join the receiver before destroying its snapshot chunk sink.
+	defer t.chunks.Close()
 	return t.trans.Close()
 }
 

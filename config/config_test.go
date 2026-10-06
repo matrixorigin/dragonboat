@@ -297,6 +297,38 @@ func TestDefaultEngineConfig(t *testing.T) {
 	}
 }
 
+func TestEngineConfigWorkerLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		snapshot uint64
+		close    uint64
+		valid    bool
+	}{
+		{"default", 48, 32, true},
+		{"zero_snapshot", 0, 32, false},
+		{"zero_close", 48, 0, false},
+		{"snapshot_limit", 65530, 32, true},
+		{"snapshot_over_limit", 65531, 32, false},
+		{"snapshot_overflow", ^uint64(0), 32, false},
+		{"close_limit", 48, 65534, true},
+		{"close_over_limit", 48, 65535, false},
+		{"close_overflow", 48, ^uint64(0), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ec := GetDefaultEngineConfig()
+			ec.SnapshotShards, ec.CloseShards = tc.snapshot, tc.close
+			if err := ec.Validate(); (err == nil) != tc.valid {
+				t.Errorf("engine validation error=%v, want valid=%t", err, tc.valid)
+			}
+			nhc := NodeHostConfig{NodeHostDir: "/validation", RTTMillisecond: 10, RaftAddress: "127.0.0.1:1"}
+			nhc.Expert.Engine = ec
+			if err := nhc.Validate(); (err == nil) != tc.valid {
+				t.Errorf("NodeHost validation error=%v, want valid=%t", err, tc.valid)
+			}
+		})
+	}
+}
+
 func TestRecordItemCodec(t *testing.T) {
 	ts := time.Now()
 	item := RecordItem{

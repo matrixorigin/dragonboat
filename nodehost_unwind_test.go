@@ -166,6 +166,28 @@ func TestNodeHostCloseBeforeWorkersInitialized(t *testing.T) {
 	}
 }
 
+func TestNodeHostRejectsUnsafeWorkerCountBeforeAcquisition(t *testing.T) {
+	fs := &constructorLockFS{IFS: vfs.NewMemFS()}
+	defer vfs.ReportLeakedFD(fs.IFS, t)
+	called := false
+	cfg := config.NodeHostConfig{NodeHostDir: "/invalid-engine", RTTMillisecond: 10, RaftAddress: "127.0.0.1:1"}
+	cfg.Expert.FS = fs
+	cfg.Expert.Engine = config.GetDefaultEngineConfig()
+	cfg.Expert.Engine.CloseShards = ^uint64(0)
+	cfg.Expert.LogDBFactory = &testLogDBFactory2{f: func(config.NodeHostConfig, config.LogDBCallback, []string, []string) (raftio.ILogDB, error) {
+		called = true
+		return nil, errors.New("factory must not run")
+	}}
+	owner, err := NewNodeHost(cfg)
+	if owner != nil {
+		owner.Close()
+		t.Fatal("invalid configuration published a host")
+	}
+	if err == nil || called || len(fs.locks) != 0 {
+		t.Fatalf("unsafe engine must fail before acquisition: error=%v factory=%t locks=%d", err, called, len(fs.locks))
+	}
+}
+
 type unwindNodeHostTransport struct {
 	raftio.ITransport
 	handle      io.Closer

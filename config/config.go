@@ -782,7 +782,7 @@ type LogDBConfig struct {
 	MaxLogFileSize                     uint64
 	// DisablePrealloc disables file preallocation using fallocate. This is useful
 	// when the filesystem (e.g., NFS) does not support fallocate system call.
-	DisablePrealloc                    bool
+	DisablePrealloc bool
 }
 
 // GetDefaultLogDBConfig returns the default configurations for the LogDB
@@ -904,8 +904,11 @@ func (ec EngineConfig) IsEmpty() bool {
 
 // Validate return an error value when the EngineConfig is invalid.
 func (ec EngineConfig) Validate() error {
+	// reflect.Select supports at most 65536 cases. The snapshot and close
+	// worker pools reserve six and two cases respectively for control events.
 	if ec.ExecShards == 0 || ec.CommitShards == 0 || ec.ApplyShards == 0 ||
-		ec.SnapshotShards == 0 || ec.CloseShards == 0 {
+		ec.SnapshotShards == 0 || ec.CloseShards == 0 ||
+		ec.SnapshotShards > 65536-6 || ec.CloseShards > 65536-2 {
 		return errors.New("invalid engine configuration")
 	}
 	return nil
