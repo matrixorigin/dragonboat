@@ -15,6 +15,8 @@
 package dragonboat
 
 import (
+	stderrors "errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"time"
@@ -741,10 +743,24 @@ type closeReq struct {
 	node *node
 }
 
+type closeOutcome struct {
+	node      *node
+	completed bool
+}
+
+// The diagnostic retains the concrete interrupted generation after scheduling
+// references are retired; it never authorizes replay of its destructor.
+type closeInterruptedError struct{ node *node }
+
+func (e *closeInterruptedError) Error() string {
+	return fmt.Sprintf("state machine close interrupted: shard %d replica %d instance %d", e.node.shardID, e.node.replicaID, e.node.instanceID)
+}
+func (e *closeInterruptedError) Unwrap() error { return ErrCloseInterrupted }
+
 type closeWorker struct {
 	stopper    *syncutil.Stopper
 	requestC   chan closeReq
-	completedC chan struct{}
+	completedC chan closeOutcome
 	workerID   uint64
 }
 
@@ -753,7 +769,7 @@ func newCloseWorker(workerID uint64, stopper *syncutil.Stopper) *closeWorker {
 		workerID:   workerID,
 		stopper:    stopper,
 		requestC:   make(chan closeReq, 1),
-		completedC: make(chan struct{}, 1),
+		completedC: make(chan closeOutcome, 1),
 	}
 	stopper.RunWorker(func() {
 		w.workerMain()
@@ -767,16 +783,18 @@ func (w *closeWorker) workerMain() {
 		case <-w.stopper.ShouldStop():
 			return
 		case req := <-w.requestC:
-			if err := w.handle(req); err != nil {
-				panicNow(err)
-			}
-			w.completed()
+			w.runRequest(req)
 		}
 	}
 }
 
-func (w *closeWorker) completed() {
-	w.completedC <- struct{}{}
+func (w *closeWorker) runRequest(req closeReq) {
+	outcome := closeOutcome{node: req.node}
+	defer func() { w.completedC <- outcome }()
+	if err := w.handle(req); err != nil {
+		panicNow(err)
+	}
+	outcome.completed = true
 }
 
 func (w *closeWorker) handle(req closeReq) error {
@@ -787,6 +805,7 @@ func (w *closeWorker) handle(req closeReq) error {
 }
 
 type closeWorkerPool struct {
+	err           error
 	ready         chan closeReq
 	busy          map[uint64]uint64
 	processing    map[uint64]struct{}
@@ -818,7 +837,7 @@ func newCloseWorkerPool(closeWorkerCount uint64) *closeWorkerPool {
 
 func (p *closeWorkerPool) close() error {
 	p.poolStopper.Stop()
-	return nil
+	return p.err
 }
 
 func (p *closeWorkerPool) workerPoolMain() {
@@ -849,7 +868,7 @@ func (p *closeWorkerPool) workerPoolMain() {
 			p.pending = append(p.pending, node)
 		} else if chosen > 1 && chosen < len(p.workers)+2 {
 			workerID := uint64(chosen - 2)
-			p.completed(workerID)
+			p.completed(workerID, v.Interface().(closeOutcome))
 		} else {
 			plog.Panicf("chosen %d, unknown case", chosen)
 		}
@@ -859,15 +878,9 @@ func (p *closeWorkerPool) workerPoolMain() {
 
 func (p *closeWorkerPool) timedWait() {
 	timer := time.NewTimer(timedCloseWait)
-	timeout := false
+	timeoutC := timer.C
 	defer timer.Stop()
 	defer p.workerStopper.Stop()
-	defer func() {
-		if timeout {
-			plog.Infof("timedWait ready to exit, busy %d, pending %d",
-				len(p.busy), len(p.pending))
-		}
-	}()
 	// p.ready is buffered, don't ignore that buffered close req
 	select {
 	case v := <-p.ready:
@@ -879,7 +892,7 @@ func (p *closeWorkerPool) timedWait() {
 	for !p.isIdle() {
 		cases[0] = reflect.SelectCase{
 			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(timer.C),
+			Chan: reflect.ValueOf(timeoutC),
 		}
 		for idx, w := range p.workers {
 			cases[1+idx] = reflect.SelectCase{
@@ -887,19 +900,16 @@ func (p *closeWorkerPool) timedWait() {
 				Chan: reflect.ValueOf(w.completedC),
 			}
 		}
-		chosen, _, _ := reflect.Select(cases)
+		chosen, v, _ := reflect.Select(cases)
 		if chosen == 0 {
-			timeout = true
-			return
+			// Stop already waits for in-flight user Close callbacks. A deadline
+			// cannot bound those callbacks; it must not discard queued owners.
+			plog.Infof("waiting for state machine closes, busy %d, pending %d",
+				len(p.busy), len(p.pending))
+			timeoutC = nil
 		} else if chosen > 0 && chosen < len(p.workers)+1 {
-			select {
-			case <-timer.C:
-				timeout = true
-				return
-			default:
-			}
 			workerID := uint64(chosen - 1)
-			p.completed(workerID)
+			p.completed(workerID, v.Interface().(closeOutcome))
 			p.schedule()
 		} else {
 			plog.Panicf("chosen %d, unknown case", chosen)
@@ -911,7 +921,7 @@ func (p *closeWorkerPool) isIdle() bool {
 	return len(p.busy) == 0 && len(p.pending) == 0
 }
 
-func (p *closeWorkerPool) completed(workerID uint64) {
+func (p *closeWorkerPool) completed(workerID uint64, outcome closeOutcome) {
 	shardID, ok := p.busy[workerID]
 	if !ok {
 		plog.Panicf("close worker %d is not in busy state", workerID)
@@ -921,6 +931,10 @@ func (p *closeWorkerPool) completed(workerID uint64) {
 	}
 	delete(p.processing, shardID)
 	delete(p.busy, workerID)
+	if !outcome.completed {
+		p.err = stderrors.Join(p.err, &closeInterruptedError{node: outcome.node})
+		p.workers[workerID] = newCloseWorker(workerID, p.workerStopper)
+	}
 }
 
 func (p *closeWorkerPool) setBusy(workerID uint64, shardID uint64) {
@@ -1025,10 +1039,16 @@ func newExecEngine(nh nodeLoader, cfg config.EngineConfig, notifyCommit bool,
 		commitCCIReady:  newWorkReady(cfg.CommitShards),
 		applyWorkReady:  newWorkReady(cfg.ApplyShards),
 		applyCCIReady:   newWorkReady(cfg.ApplyShards),
-		wp:              newWorkerPool(nh, cfg.SnapshotShards, loaded),
-		cp:              newCloseWorkerPool(cfg.CloseShards),
 		notifyCommit:    notifyCommit,
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			_ = s.close()
+		}
+	}()
+	s.wp = newWorkerPool(nh, cfg.SnapshotShards, loaded)
+	s.cp = newCloseWorkerPool(cfg.CloseShards)
 	if errorInjection {
 		s.ec = make(chan error, 1)
 	}
@@ -1061,6 +1081,7 @@ func newExecEngine(nh nodeLoader, cfg config.EngineConfig, notifyCommit bool,
 			s.applyWorkerMain(applyWorkerID)
 		})
 	}
+	completed = true
 	return s
 }
 
@@ -1071,13 +1092,17 @@ func (e *engine) crash(err error) {
 	}
 }
 
-func (e *engine) close() error {
+func (e *engine) close() (err error) {
+	if e.cp != nil {
+		defer func() { err = stderrors.Join(err, e.cp.close()) }()
+	}
+	if e.wp != nil {
+		defer func() { err = stderrors.Join(err, e.wp.close()) }()
+	}
 	e.nodeStopper.Stop()
 	e.commitStopper.Stop()
 	e.taskStopper.Stop()
-	var err error
-	err = firstError(err, e.wp.close())
-	return firstError(err, e.cp.close())
+	return err
 }
 
 func (e *engine) nodeLoaded(shardID uint64, replicaID uint64) bool {

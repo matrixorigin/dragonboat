@@ -57,6 +57,7 @@ package dragonboat // github.com/lni/dragonboat/v4
 
 import (
 	"context"
+	stderrors "errors"
 	"math"
 	"reflect"
 	"runtime"
@@ -105,6 +106,8 @@ var (
 )
 
 var (
+	// ErrCloseInterrupted indicates native teardown exited without completing.
+	ErrCloseInterrupted = errors.New("dragonboat: close interrupted")
 	// ErrClosed is returned when a request is made on closed NodeHost instance.
 	ErrClosed = errors.New("dragonboat: closed")
 	// ErrReplicaRemoved indictes that the requested node has been removed.
@@ -279,6 +282,7 @@ type NodeHost struct {
 		leaderInfoQ *leaderInfoQueue
 		raft        raftio.IRaftEventListener
 		sys         *sysEventListener
+		started     bool
 	}
 	registry     INodeHostRegistry
 	nodes        registry.INodeRegistry
@@ -293,6 +297,8 @@ type NodeHost struct {
 	requestPools []*sync.Pool
 	partitioned  int32
 	closed       int32
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 var _ nodeLoader = (*NodeHost)(nil)
@@ -303,7 +309,7 @@ var firstError = utils.FirstError
 
 // NewNodeHost creates a new NodeHost instance. In a typical application, it is
 // expected to have one NodeHost on each server.
-func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
+func NewNodeHost(nhConfig config.NodeHostConfig) (_ *NodeHost, err error) {
 	logBuildTagsAndVersion()
 	if err := nhConfig.Validate(); err != nil {
 		return nil, err
@@ -311,16 +317,24 @@ func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
 	if err := nhConfig.Prepare(); err != nil {
 		return nil, err
 	}
-	env, err := server.NewEnv(nhConfig, nhConfig.Expert.FS)
+	nh := &NodeHost{nhConfig: nhConfig, fs: nhConfig.Expert.FS}
+	completed := false
+	defer func() {
+		if !completed {
+			if cleanupErr := nh.CloseWithError(); cleanupErr != nil {
+				if err != nil {
+					err = stderrors.Join(err, cleanupErr)
+				} else {
+					plog.Errorf("NodeHost constructor rollback: %v", cleanupErr)
+				}
+			}
+		}
+	}()
+	nh.env, err = server.NewEnv(nhConfig, nhConfig.Expert.FS)
 	if err != nil {
 		return nil, err
 	}
-	nh := &NodeHost{
-		env:      env,
-		nhConfig: nhConfig,
-		stopper:  syncutil.NewStopper(),
-		fs:       nhConfig.Expert.FS,
-	}
+	nh.stopper = syncutil.NewStopper()
 	// make static check happy
 	_ = nh.partitioned
 	nh.events.raft = nhConfig.RaftEventListener
@@ -334,30 +348,20 @@ func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
 		nh.stopper.RunWorker(func() {
 			nh.handleListenerEvents()
 		})
+		nh.events.started = true
 	}
 	nh.msgHandler = newNodeHostMessageHandler(nh)
 	nh.createPools()
-	defer func() {
-		if r := recover(); r != nil {
-			nh.Close()
-			if r, ok := r.(error); ok {
-				panicNow(r)
-			}
-		}
-	}()
 	did := nh.nhConfig.GetDeploymentID()
 	plog.Infof("DeploymentID set to %d", did)
 	if err := nh.createLogDB(); err != nil {
-		nh.Close()
 		return nil, err
 	}
 	if err := nh.loadNodeHostID(); err != nil {
-		nh.Close()
 		return nil, err
 	}
 	plog.Infof("NodeHost ID: %s", nh.id.String())
 	if err := nh.createNodeRegistry(); err != nil {
-		nh.Close()
 		return nil, err
 	}
 	errorInjection := false
@@ -368,7 +372,6 @@ func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
 	nh.engine = newExecEngine(nh, nhConfig.Expert.Engine,
 		nh.nhConfig.NotifyCommit, errorInjection, nh.env, nh.mu.logdb)
 	if err := nh.createTransport(); err != nil {
-		nh.Close()
 		return nil, err
 	}
 	nh.stopper.RunWorker(func() {
@@ -378,21 +381,91 @@ func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
 		nh.tickWorkerMain()
 	})
 	nh.logNodeHostDetails()
+	completed = true
 	return nh, nil
 }
 
 // Close stops all managed Raft nodes and releases all resources owned by the
 // NodeHost instance.
 func (nh *NodeHost) Close() {
-	nh.events.sys.Publish(server.SystemEvent{
-		Type: server.NodeHostShuttingDown,
-	})
 	nh.mu.Lock()
 	if atomic.LoadInt32(&nh.closed) != 0 {
+		nh.mu.Unlock()
 		panic("NodeHost.Stop called twice")
 	}
 	atomic.StoreInt32(&nh.closed, 1)
 	nh.mu.Unlock()
+	if err := nh.CloseWithError(); err != nil {
+		panicNow(err)
+	}
+}
+
+// CloseWithError stops the NodeHost and returns teardown diagnostics after
+// tracked workers join. ErrCloseInterrupted means native destruction did not
+// complete; its diagnostic retains that owner. Repeated calls wait and return
+// its cached result. It also accepts a partially constructed NodeHost.
+func (nh *NodeHost) CloseWithError() error {
+	nh.closeOnce.Do(func() {
+		// Once consumes the callback even when it exits abnormally. Keep a
+		// terminal diagnostic unless teardown returns normally; do not retry
+		// destructors whose ownership may already have been consumed.
+		nh.closeErr = ErrCloseInterrupted
+		nh.closeErr = nh.close()
+	})
+	return nh.closeErr
+}
+
+func (nh *NodeHost) close() (err error) {
+	// Preserve already returned owner-bearing diagnostics if a later callback
+	// panics or calls Goexit. Normal Once completion replaces the prearmed result.
+	defer func() { nh.closeErr = stderrors.Join(nh.closeErr, err) }()
+	nh.mu.Lock()
+	atomic.StoreInt32(&nh.closed, 1)
+	nh.mu.Unlock()
+	// Arm each existing owner independently before calling external callbacks.
+	// Deferred order preserves the original shutdown dependency order.
+	defer func() {
+		if nh.env != nil {
+			// Session creation borrows the environment random source after shutdown.
+			// Once owns teardown; the environment reference remains valid.
+			err = stderrors.Join(err, nh.env.Close())
+		}
+	}()
+	defer func() {
+		if nh.mu.logdb != nil {
+			owned := nh.mu.logdb
+			nh.mu.logdb = nil
+			err = stderrors.Join(err, owned.Close())
+		}
+	}()
+	defer func() {
+		if nh.engine != nil {
+			owned := nh.engine
+			nh.engine = nil
+			defer func() { nh.transport = nil }()
+			err = stderrors.Join(err, owned.close())
+		}
+	}()
+	defer func() {
+		if nh.nodes != nil {
+			owned := nh.nodes
+			nh.nodes = nil
+			err = stderrors.Join(err, owned.Close())
+		}
+	}()
+	defer func() {
+		if nh.transport != nil {
+			err = stderrors.Join(err, nh.transport.Close())
+		}
+	}()
+	defer func() {
+		if nh.stopper != nil {
+			nh.stopper.Stop()
+		}
+	}()
+	if nh.events.started {
+		nh.events.sys.Publish(server.SystemEvent{Type: server.NodeHostShuttingDown})
+	}
 	nodes := make([]raftio.NodeInfo, 0)
 	nh.forEachShard(func(cid uint64, node *node) bool {
 		nodes = append(nodes, raftio.NodeInfo{
@@ -407,34 +480,7 @@ func (nh *NodeHost) Close() {
 				logutil.ShardID(node.ShardID))
 		}
 	}
-	plog.Debugf("%s is stopping the nh stopper", nh.describe())
-	nh.stopper.Stop()
-	var err error
-	plog.Debugf("%s is stopping the tranport module", nh.describe())
-	if nh.transport != nil {
-		err = firstError(err, nh.transport.Close())
-	}
-	if nh.nodes != nil {
-		err = firstError(err, nh.nodes.Close())
-		nh.nodes = nil
-	}
-	plog.Debugf("%s is stopping the engine module", nh.describe())
-	if nh.engine != nil {
-		err = firstError(err, nh.engine.close())
-		nh.engine = nil
-		nh.transport = nil
-	}
-	plog.Debugf("%s is stopping the logdb module", nh.describe())
-	if nh.mu.logdb != nil {
-		err = firstError(err, nh.mu.logdb.Close())
-		nh.mu.logdb = nil
-	}
-	plog.Debugf("%s is stopping the env module", nh.describe())
-	err = firstError(err, nh.env.Close())
-	plog.Debugf("NodeHost %s stopped", nh.describe())
-	if err != nil {
-		panicNow(err)
-	}
+	return nil
 }
 
 // NodeHostConfig returns the NodeHostConfig instance used for configuring this
