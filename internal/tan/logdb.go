@@ -37,6 +37,7 @@ db.mu.nodeStates. This means each raft node will have its own nodeIndex.
 package tan
 
 import (
+	stderrors "errors"
 	"io"
 	"sync"
 	"time"
@@ -120,7 +121,7 @@ func CreateLogMultiplexedTan(cfg config.NodeHostConfig, cb config.LogDBCallback,
 }
 
 func createTan(cfg config.NodeHostConfig, cb config.LogDBCallback,
-	dirs []string, wals []string, singleNodeLog bool) (*LogDB, error) {
+	dirs []string, wals []string, singleNodeLog bool) (_ *LogDB, err error) {
 	if cfg.Expert.FS == nil {
 		panic("fs not set")
 	}
@@ -142,13 +143,24 @@ func createTan(cfg config.NodeHostConfig, cb config.LogDBCallback,
 			cfg.Expert.LogDB.DisablePrealloc,
 		),
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			if cleanupErr := ldb.Close(); cleanupErr != nil {
+				if err != nil {
+					err = stderrors.Join(err, cleanupErr)
+				} else {
+					plog.Errorf("Tan constructor rollback: %v", cleanupErr)
+				}
+			}
+		}
+	}()
 	for i := 0; i < len(ldb.buffers); i++ {
 		ldb.buffers[i] = make([]byte, cfg.Expert.LogDB.KVWriteBufferSize)
 	}
 	for i := 0; i < len(ldb.wgs); i++ {
 		ldb.wgs[i] = new(sync.WaitGroup)
 	}
-	var err error
 	if err := fileutil.MkdirAll(ldb.dirname, ldb.fs); err != nil {
 		return nil, err
 	}
@@ -174,6 +186,7 @@ func createTan(cfg config.NodeHostConfig, cb config.LogDBCallback,
 		return nil, err
 	}
 	ldb.fileLock = fileLock
+	completed = true
 	return ldb, nil
 }
 
@@ -214,16 +227,44 @@ func (l *LogDB) Name() string {
 
 // Close closes the ILogDB instance.
 func (l *LogDB) Close() (err error) {
+	// Parent handles outlive every child, including abnormal child destruction.
+	if l.fileLock != nil {
+		defer func() {
+			lock := l.fileLock
+			l.fileLock = nil
+			err = stderrors.Join(err, lock.Close())
+		}()
+	}
+	if l.dir != nil {
+		defer func() {
+			file := l.dir
+			l.dir = nil
+			err = stderrors.Join(err, file.Close())
+		}()
+	}
+	if l.bsDir != nil {
+		defer func() {
+			file := l.bsDir
+			l.bsDir = nil
+			err = stderrors.Join(err, file.Close())
+		}()
+	}
 	func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		err = firstError(err, l.collection.iterate(func(db *db) error {
-			return db.close()
-		}))
+		// Snapshot existing ownership before invoking any child destructor. The
+		// temporary pointer list adds no admission, retry or execution state.
+		var children []*db
+		iterationErr := l.collection.iterate(func(child *db) error {
+			children = append(children, child)
+			return nil
+		})
+		err = stderrors.Join(err, iterationErr)
+		for _, child := range children {
+			defer func() { err = stderrors.Join(err, child.close()) }()
+		}
 	}()
-	err = firstError(err, l.bsDir.Close())
-	err = firstError(err, l.dir.Close())
-	return firstError(err, l.fileLock.Close())
+	return err
 }
 
 // BinaryFormat returns an constant uint32 value representing the binary
@@ -312,7 +353,7 @@ func (l *LogDB) concurrentSaveState(updates []pb.Update, shardID uint64) error {
 	return nil
 }
 
-func (l *LogDB) sequentialSaveState(updates []pb.Update, shardID uint64) error {
+func (l *LogDB) sequentialSaveState(updates []pb.Update, shardID uint64) (err error) {
 	var wg *sync.WaitGroup
 	var buf []byte
 	if shardID-1 < uint64(len(l.buffers)) {
@@ -325,7 +366,14 @@ func (l *LogDB) sequentialSaveState(updates []pb.Update, shardID uint64) error {
 	} else {
 		wg = new(sync.WaitGroup)
 	}
-	for _, ud := range updates {
+	outcomes := make([]error, len(updates))
+	defer func() {
+		wg.Wait()
+		for _, outcome := range outcomes {
+			err = stderrors.Join(err, outcome)
+		}
+	}()
+	for idx, ud := range updates {
 		db, err := l.getDB(ud.ShardID, ud.ReplicaID)
 		if err != nil {
 			return err
@@ -335,16 +383,15 @@ func (l *LogDB) sequentialSaveState(updates []pb.Update, shardID uint64) error {
 			return err
 		}
 		if sync {
+			outcomes[idx] = errPersistenceInterrupted
 			wg.Add(1)
 			go func() {
-				if err := db.sync(); err != nil {
-					panicNow(err)
-				}
-				wg.Done()
+				defer wg.Done()
+				// Goexit leaves the interrupted outcome; a normal return replaces it.
+				outcomes[idx] = db.sync()
 			}()
 		}
 	}
-	wg.Wait()
 	return nil
 }
 

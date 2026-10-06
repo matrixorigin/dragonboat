@@ -19,8 +19,13 @@
 package tan
 
 import (
+	"bytes"
+	"io"
 	"math"
 	"os"
+	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -574,21 +579,37 @@ func TestDBIndexIsSavedOnClose(t *testing.T) {
 
 func TestRebuildIndex(t *testing.T) {
 	fs := vfs.NewMem()
-	var logNum fileNum
+	var logNum, laterLogNum fileNum
 	var savedIndex index
 	var snapshot indexEntry
-	var dirname string
+	dirname := "/Users/lni/db-dir"
+	run := func(check func(*testing.T, *db)) {
+		opts := &Options{MaxManifestFileSize: MaxManifestFileSize, MaxLogFileSize: MaxLogFileSize, FS: fs}
+		require.NoError(t, fileutil.MkdirAll(dirname, fs))
+		owner, err := open(1, 1, dirname, dirname, opts)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, owner.close(), "healthy fixture close must publish its index") }()
+		check(t, owner)
+	}
+	defer vfs.ReportLeakedFD(fs, t)
 	tf := func(t *testing.T, db *db) {
 		dirname = db.dirname
 		buf := make([]byte, 1024)
-		for i := uint64(1); i <= uint64(1000); i++ {
+		// Two entries on each side of the compaction boundary retain the
+		// prefix/suffix behavior without 1000 identical record writes.
+		for i := uint64(499); i <= uint64(502); i++ {
 			u := pb.Update{
 				ShardID:   2,
 				ReplicaID: 3,
+				State:     pb.State{Term: 10, Commit: i},
 				EntriesToSave: []pb.Entry{
-					{Index: i, Term: 5},
+					{Index: i, Term: 10},
 				},
 				Snapshot: pb.Snapshot{Index: 300, Term: 10},
+			}
+			// Preserve physical record-block crossing without 1000 small writes.
+			if i == 499 {
+				u.EntriesToSave[0].Cmd = bytes.Repeat([]byte("x"), 2*blockSize+17)
 			}
 			_, err := db.write(u, buf)
 			require.NoError(t, err)
@@ -596,19 +617,78 @@ func TestRebuildIndex(t *testing.T) {
 		require.NoError(t, db.removeEntries(2, 3, 500))
 		logNum = db.mu.logNum
 		savedIndex = db.mu.nodeStates.getIndex(2, 3).entries
-		snapshot = db.mu.nodeStates.getIndex(2, 3).snapshot
-	}
-	runTanTest(t, nil, tf, fs)
+		require.Len(t, savedIndex.entries, 4)
+		retained := 0
+		for _, entry := range savedIndex.entries {
+			require.Equal(t, logNum, entry.fileNum)
+			if entry.start > 500 {
+				retained++
+				require.Greater(t, entry.pos, int64(blockSize), "retained suffix locators must seek beyond the first physical block")
+			}
+		}
+		require.Equal(t, 2, retained)
 
+		snapshot = db.mu.nodeStates.getIndex(2, 3).snapshot
+		func() {
+			db.mu.Lock()
+			defer db.mu.Unlock()
+			require.NoError(t, db.switchToNewLog())
+			laterLogNum = db.mu.logNum
+			node := db.mu.nodeStates.getIndex(2, 3)
+			require.Empty(t, node.currEntries.entries, "new segment cannot inherit prior entries")
+			require.Zero(t, node.currEntries.compactedTo, "new segment cannot inherit prior compaction record")
+			require.Equal(t, uint64(500), node.entries.compactedTo, "cumulative compaction boundary must survive rotation")
+		}()
+	}
+	run(tf)
+
+	readSource := func() []byte {
+		file, err := fs.Open(makeFilename(fs, dirname, fileTypeLog, logNum))
+		require.NoError(t, err)
+		defer func() { require.NoError(t, file.Close()) }()
+		data, err := io.ReadAll(file)
+		require.NoError(t, err)
+		return data
+	}
+	sourceBytes := readSource()
+	for _, number := range []fileNum{logNum, laterLogNum} {
+		_, err := fs.Stat(makeFilename(fs, dirname, fileTypeLog, number))
+		require.NoError(t, err)
+		_, err = fs.Stat(makeFilename(fs, dirname, fileTypeIndex, number))
+		require.NoError(t, err)
+	}
 	fn := makeFilename(fs, dirname, fileTypeIndex, logNum)
 	require.NoError(t, fs.RemoveAll(fn))
 
 	tf = func(t *testing.T, db *db) {
+		state, err := db.getRaftState(2, 3, 500)
+		require.NoError(t, err)
+		require.Equal(t, raftio.RaftState{State: pb.State{Term: 10, Commit: 502}, FirstIndex: 501, EntryCount: 2}, state)
+		entries, _, err := db.getEntries(2, 3, nil, 0, 501, 503, ^uint64(0))
+		require.NoError(t, err)
+		require.Equal(t, []pb.Entry{{Index: 501, Term: 10}, {Index: 502, Term: 10}}, entries)
+		ss, err := db.getSnapshot(2, 3)
+		require.NoError(t, err)
+		require.Equal(t, pb.Snapshot{Index: 300, Term: 10}, ss)
 		require.Equal(t, savedIndex, db.mu.nodeStates.getIndex(2, 3).entries)
 		require.Equal(t, snapshot, db.mu.nodeStates.getIndex(2, 3).snapshot)
 		require.Equal(t, uint64(500), db.mu.nodeStates.compactedTo(2, 3))
+		require.Equal(t, sourceBytes, readSource(), "rebuilding derived index cannot alter intact source bytes")
+		_, err = fs.Stat(fn)
+		require.NoError(t, err, "missing historical index must be rebuilt")
+		_, err = db.write(pb.Update{ShardID: 2, ReplicaID: 3, State: pb.State{Term: 10, Commit: 503}, EntriesToSave: []pb.Entry{{Index: 503, Term: 10, Cmd: []byte("after-recovery")}}}, nil)
+		require.NoError(t, err)
+		require.NoError(t, db.sync())
 	}
-	runTanTest(t, nil, tf, fs)
+	run(tf)
+	run(func(t *testing.T, owner *db) {
+		entries, _, err := owner.getEntries(2, 3, nil, 0, 501, 504, ^uint64(0))
+		require.NoError(t, err)
+		require.Equal(t, []pb.Entry{{Index: 501, Term: 10}, {Index: 502, Term: 10}, {Index: 503, Term: 10, Cmd: []byte("after-recovery")}}, entries)
+		state, err := owner.getRaftState(2, 3, 500)
+		require.NoError(t, err)
+		require.Equal(t, raftio.RaftState{State: pb.State{Term: 10, Commit: 503}, FirstIndex: 501, EntryCount: 3}, state)
+	})
 }
 
 func TestRebuildLog(t *testing.T) {
@@ -925,6 +1005,10 @@ type faultyTempLogFS struct {
 	// been written (e.g. ENOSPC part-way through the copy); negative disables.
 	writeLimit int
 	failSync   bool
+	closeMode  string
+	t          *testing.T
+	closes     int
+	renames    int
 }
 
 func (fs *faultyTempLogFS) Create(name string) (vfs.File, error) {
@@ -932,13 +1016,22 @@ func (fs *faultyTempLogFS) Create(name string) (vfs.File, error) {
 	if err != nil || name != fs.tempLog {
 		return f, err
 	}
-	return &faultyFile{File: f, fs: fs}, nil
+	owned := &faultyFile{File: f, fs: fs}
+	if fs.t != nil {
+		fs.t.Cleanup(func() {
+			if owned.closes == 0 {
+				require.NoError(fs.t, owned.Close())
+			}
+		})
+	}
+	return owned, nil
 }
 
 type faultyFile struct {
 	vfs.File
 	fs      *faultyTempLogFS
 	written int
+	closes  int
 }
 
 func (f *faultyFile) Write(p []byte) (int, error) {
@@ -957,6 +1050,80 @@ func (f *faultyFile) Sync() error {
 		return vfs.ErrInjected
 	}
 	return f.File.Sync()
+}
+
+func (fs *faultyTempLogFS) Rename(old, new string) error {
+	fs.renames++
+	return fs.FS.Rename(old, new)
+}
+
+func (f *faultyFile) Close() error {
+	f.closes++
+	f.fs.closes++
+	err := f.File.Close()
+	switch f.fs.closeMode {
+	case "error":
+		return errors.Wrap(vfs.ErrInjected, "completed replay Close")
+	case "panic":
+		panic(vfs.ErrInjected)
+	case "Goexit":
+		runtime.Goexit()
+	}
+	return err
+}
+
+func TestRebuildLogConsumesCompletedCloseOnce(t *testing.T) {
+	for _, mode := range []string{"clean", "error", "panic", "Goexit"} {
+		t.Run(mode, func(t *testing.T) {
+			mem := vfs.NewStrictMem()
+			t.Cleanup(func() { vfs.ReportLeakedFD(mem, t) })
+			require.NoError(t, mem.MkdirAll("/replay-close", 0700))
+			fs := &faultyTempLogFS{FS: mem, t: t, writeLimit: -1, closeMode: mode}
+			owner, err := open(1, 1, "replay", "/replay-close", &Options{FS: fs, DisablePrealloc: true, MaxLogFileSize: 64 * 1024})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, owner.close()) })
+			_, err = owner.write(pb.Update{ShardID: 2, ReplicaID: 3, EntriesToSave: []pb.Entry{{Term: 5, Index: 1, Cmd: []byte("retained")}}}, nil)
+			require.NoError(t, err)
+			require.NoError(t, owner.sync())
+			fs.tempLog = makeFilename(mem, "/replay-close", fileTypeLogTemp, owner.mu.logNum)
+			fs.renames = 0
+			done := make(chan struct{})
+			var recovered any
+			returned := false
+			go func() {
+				defer close(done)
+				defer func() { recovered = recover() }()
+				err = owner.rebuildLog(owner.mu.logNum)
+				returned = true
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("replay consuming Close did not unwind")
+			}
+			require.Equal(t, 1, fs.closes, "completed native Close consumes descriptor even on abnormal return")
+			if mode == "panic" {
+				require.False(t, returned)
+				require.Same(t, vfs.ErrInjected, recovered)
+			} else if mode == "Goexit" {
+				require.False(t, returned)
+				require.Nil(t, recovered)
+			} else {
+				require.True(t, returned)
+				require.Nil(t, recovered)
+				if mode == "error" {
+					require.ErrorIs(t, err, vfs.ErrInjected)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+			if mode == "clean" {
+				require.Equal(t, 1, fs.renames)
+			} else {
+				require.Zero(t, fs.renames, "interrupted or failed Close must not publish copy")
+			}
+		})
+	}
 }
 
 // Review: rebuildLog must publish the copied log only after the copy is
@@ -1012,7 +1179,7 @@ func TestRebuildLogFailureKeepsOriginal(t *testing.T) {
 			original, err := os.ReadFile(logFn)
 			require.NoError(t, err)
 
-			faulty := &faultyTempLogFS{FS: fs, tempLog: tmpFn, writeLimit: tc.writeLimit, failSync: tc.failSync}
+			faulty := &faultyTempLogFS{FS: fs, t: t, tempLog: tmpFn, writeLimit: tc.writeLimit, failSync: tc.failSync}
 			_, err = open(1, 1, dirname, dirname, &Options{MaxManifestFileSize: MaxManifestFileSize, FS: faulty})
 			require.ErrorIs(t, err, vfs.ErrInjected)
 
@@ -1030,6 +1197,225 @@ func TestRebuildLogFailureKeepsOriginal(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 19, len(result))
 			require.NoError(t, db.close())
+		})
+	}
+}
+
+// A later owned generation proves the historical source was sealed. Missing
+// derived indexes do not authorize truncating any record in that source.
+func TestRecoveryRejectsNonTailOrSealedCorruption(t *testing.T) {
+	for _, mode := range []string{"truncated final record", "final payload CRC", "newest middle zero header", "historical tail with orphan", "newest tail with orphan"} {
+		t.Run(mode, func(t *testing.T) {
+			fs := vfs.Default
+			t.Cleanup(func() { vfs.ReportLeakedFD(fs, t) })
+			dir := t.TempDir()
+			require.NoError(t, fs.MkdirAll(dir, 0700))
+			opts := &Options{FS: fs, DisablePrealloc: true, MaxLogFileSize: 128 * 1024}
+			seed, err := open(1, 1, "seed", dir, opts)
+			require.NoError(t, err)
+			var closeOnce sync.Once
+			closeSeed := func() { closeOnce.Do(func() { require.NoError(t, seed.close()) }) }
+			t.Cleanup(closeSeed)
+			count := uint64(2)
+			if mode == "newest middle zero header" {
+				count = 3
+			}
+			for i := uint64(1); i <= count; i++ {
+				_, err = seed.write(pb.Update{ShardID: 1, ReplicaID: 1, EntriesToSave: []pb.Entry{{Index: i, Term: 1, Cmd: []byte("sealed-payload")}}}, nil)
+				require.NoError(t, err)
+			}
+			old := seed.mu.logNum
+			if mode != "newest middle zero header" && mode != "newest tail with orphan" {
+				func() { seed.mu.Lock(); defer seed.mu.Unlock(); require.NoError(t, seed.switchToNewLog()) }()
+			}
+			closeSeed()
+			sourceName := makeFilename(fs, dir, fileTypeLog, old)
+			readSource := func() []byte {
+				file, err := fs.Open(sourceName)
+				require.NoError(t, err)
+				defer func() { require.NoError(t, file.Close()) }()
+				data, err := io.ReadAll(file)
+				require.NoError(t, err)
+				return data
+			}
+			damaged := readSource()
+			if mode == "newest middle zero header" {
+				reader := newReader(bytes.NewReader(damaged), old)
+				first, err := reader.next()
+				require.NoError(t, err)
+				_, err = io.Copy(io.Discard, first)
+				require.NoError(t, err)
+				secondOffset := int(reader.offset())
+				for i := 0; i < legacyHeaderSize; i++ {
+					damaged[secondOffset+i] = 0
+				}
+			} else if mode == "truncated final record" || strings.Contains(mode, "with orphan") {
+				damaged = damaged[:len(damaged)-1]
+			} else {
+				damaged[len(damaged)-1] ^= 0xff
+			}
+			func() {
+				file, err := fs.Create(sourceName)
+				require.NoError(t, err)
+				defer func() { require.NoError(t, file.Close()) }()
+				_, err = file.Write(damaged)
+				require.NoError(t, err)
+				require.NoError(t, file.Sync())
+			}()
+			if strings.Contains(mode, "with orphan") {
+				func() {
+					file, err := fs.Create(makeFilename(fs, dir, fileTypeLog, old+100))
+					require.NoError(t, err)
+					defer func() { require.NoError(t, file.Close()) }()
+					_, err = file.Write([]byte("not manifest-owned"))
+					require.NoError(t, err)
+				}()
+			}
+			indexName := makeFilename(fs, dir, fileTypeIndex, old)
+			require.NoError(t, fs.Remove(indexName))
+			owner, err := open(1, 1, "recovery", dir, opts)
+			if owner != nil {
+				t.Cleanup(func() { require.NoError(t, owner.close()) })
+			}
+			if mode == "newest tail with orphan" {
+				require.NoError(t, err, "higher orphan cannot revoke newest owned tail repair")
+				entries, _, err := owner.getEntries(1, 1, nil, 0, 1, 3, ^uint64(0))
+				require.NoError(t, err)
+				require.Equal(t, []pb.Entry{{Index: 1, Term: 1, Cmd: []byte("sealed-payload")}}, entries)
+				return
+			}
+			require.Error(t, err, "sealed source corruption cannot be repaired as newest tail")
+			require.Nil(t, owner)
+			if mode == "newest middle zero header" {
+				require.ErrorIs(t, err, ErrCorruptChunk)
+			}
+			require.Equal(t, damaged, readSource(), "failed recovery must preserve original corrupted evidence")
+			_, statErr := fs.Stat(indexName)
+			require.ErrorIs(t, statErr, os.ErrNotExist, "failed replay cannot publish derived index")
+			_, statErr = fs.Stat(makeFilename(fs, dir, fileTypeLogTemp, old))
+			require.ErrorIs(t, statErr, os.ErrNotExist, "rejected corruption cannot leave a replacement log")
+		})
+	}
+}
+
+type reverseRecoveryFS struct{ vfs.FS }
+
+func (f reverseRecoveryFS) List(name string) ([]string, error) {
+	names, err := f.FS.List(name)
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	return names, err
+}
+
+func TestMixedRecoveryPreservesChronologicalOverwriteAndCompaction(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		missing []int
+	}{
+		{"alternating", []int{0, 2}}, {"all missing", []int{0, 1, 2, 3}}, {"newest missing", []int{3}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := vfs.NewMem()
+			t.Cleanup(func() { vfs.ReportLeakedFD(fs, t) })
+			const dir = "/mixed-recovery"
+			require.NoError(t, fs.MkdirAll(dir, 0700))
+			opts := &Options{FS: reverseRecoveryFS{fs}, DisablePrealloc: true, MaxLogFileSize: 128 * 1024}
+			seed, err := open(1, 1, "seed", dir, opts)
+			require.NoError(t, err)
+			var seedOnce sync.Once
+			closeSeed := func() { seedOnce.Do(func() { require.NoError(t, seed.close()) }) }
+			t.Cleanup(closeSeed)
+			logs := []fileNum{seed.mu.logNum}
+			write := func(u pb.Update) { _, err := seed.write(u, nil); require.NoError(t, err) }
+			rotate := func() {
+				func() { seed.mu.Lock(); defer seed.mu.Unlock(); require.NoError(t, seed.switchToNewLog()) }()
+				logs = append(logs, seed.mu.logNum)
+			}
+			write(pb.Update{ShardID: 1, ReplicaID: 1, State: pb.State{Term: 1, Commit: 2}, Snapshot: pb.Snapshot{Index: 1, Term: 1}, EntriesToSave: []pb.Entry{{Index: 1, Term: 1, Cmd: []byte("a1")}, {Index: 2, Term: 1, Cmd: []byte("old2")}}})
+			write(pb.Update{ShardID: 2, ReplicaID: 1, State: pb.State{Term: 1, Commit: 1}, Snapshot: pb.Snapshot{Index: 1, Term: 1}, EntriesToSave: []pb.Entry{{Index: 1, Term: 1, Cmd: []byte("other1")}}})
+			rotate()
+			write(pb.Update{ShardID: 1, ReplicaID: 1, State: pb.State{Term: 2, Commit: 3}, Snapshot: pb.Snapshot{Index: 2, Term: 2}, EntriesToSave: []pb.Entry{{Index: 2, Term: 2, Cmd: []byte("new2")}, {Index: 3, Term: 2, Cmd: []byte("b3")}}})
+			rotate()
+			require.NoError(t, seed.removeEntries(1, 1, 1)) // This segment has no entries, only a compaction record.
+			rotate()
+			write(pb.Update{ShardID: 1, ReplicaID: 1, State: pb.State{Term: 2, Commit: 4}, EntriesToSave: []pb.Entry{{Index: 4, Term: 2, Cmd: []byte("d4")}}})
+			write(pb.Update{ShardID: 2, ReplicaID: 1, State: pb.State{Term: 2, Commit: 2}, EntriesToSave: []pb.Entry{{Index: 2, Term: 2, Cmd: []byte("other2")}}})
+			closeSeed()
+			require.Len(t, logs, 4)
+			for _, i := range tc.missing {
+				require.NoError(t, fs.Remove(makeFilename(fs, dir, fileTypeIndex, logs[i])))
+			}
+			check := func(owner *db, fresh bool) {
+				expected := []pb.Entry{{Index: 2, Term: 2, Cmd: []byte("new2")}, {Index: 3, Term: 2, Cmd: []byte("b3")}, {Index: 4, Term: 2, Cmd: []byte("d4")}}
+				end, commit := uint64(5), uint64(4)
+				if fresh {
+					expected = append(expected, pb.Entry{Index: 5, Term: 2, Cmd: []byte("fresh5")})
+					end, commit = 6, 5
+				}
+				entries, _, err := owner.getEntriesWithMultiplexed(1, 1, nil, 0, 2, end, ^uint64(0))
+				require.NoError(t, err)
+				require.Equal(t, expected, entries)
+				state, err := owner.getRaftState(1, 1, 1)
+				require.NoError(t, err)
+				require.Equal(t, raftio.RaftState{State: pb.State{Term: 2, Commit: commit}, FirstIndex: 2, EntryCount: end - 2}, state)
+				snapshot, err := owner.getSnapshot(1, 1)
+				require.NoError(t, err)
+				require.Equal(t, pb.Snapshot{Index: 2, Term: 2}, snapshot)
+				require.Equal(t, uint64(1), owner.mu.nodeStates.compactedTo(1, 1))
+				entries, _, err = owner.getEntriesWithMultiplexed(2, 1, nil, 0, 1, 3, ^uint64(0))
+				require.NoError(t, err)
+				require.Equal(t, []pb.Entry{{Index: 1, Term: 1, Cmd: []byte("other1")}, {Index: 2, Term: 2, Cmd: []byte("other2")}}, entries)
+				state, err = owner.getRaftState(2, 1, 0)
+				require.NoError(t, err)
+				require.Equal(t, raftio.RaftState{State: pb.State{Term: 2, Commit: 2}, FirstIndex: 1, EntryCount: 2}, state)
+				snapshot, err = owner.getSnapshot(2, 1)
+				require.NoError(t, err)
+				require.Equal(t, pb.Snapshot{Index: 1, Term: 1}, snapshot)
+			}
+			run := func(fresh bool, action func(*db)) {
+				owner, err := open(1, 1, "recovery", dir, opts)
+				require.NoError(t, err)
+				defer func() { require.NoError(t, owner.close()) }()
+				check(owner, fresh)
+				if action != nil {
+					action(owner)
+				}
+			}
+			run(false, func(owner *db) {
+				// Decode each rebuilt disk index separately, comparing to literal
+				// segment contents rather than the cumulative in-memory accumulator.
+				ranges := [4][2][2]uint64{{{1, 2}, {1, 1}}, {{2, 3}, {0, 0}}, {{0, 0}, {0, 0}}, {{4, 4}, {2, 2}}}
+				for _, segment := range tc.missing {
+					func() {
+						file, err := fs.Open(makeFilename(fs, dir, fileTypeIndex, logs[segment]))
+						require.NoError(t, err)
+						defer func() { require.NoError(t, file.Close()) }()
+						decoded := newNodeStates()
+						require.NoError(t, decoded.load(file))
+						for shard := uint64(1); shard <= 2; shard++ {
+							node := decoded.getIndex(shard, 1)
+							span := ranges[segment][shard-1]
+							if span[0] == 0 {
+								require.Empty(t, node.entries.entries)
+							} else {
+								require.Len(t, node.entries.entries, 1)
+								entry := node.entries.entries[0]
+								require.Equal(t, span[0], entry.start)
+								require.Equal(t, span[1], entry.end)
+								require.Equal(t, logs[segment], entry.fileNum)
+							}
+							marker := uint64(0)
+							if segment == 2 && shard == 1 {
+								marker = 1
+							}
+							require.Equal(t, marker, node.entries.compactedTo, "compaction records belong only to their physical segment")
+						}
+					}()
+				}
+				_, err := owner.write(pb.Update{ShardID: 1, ReplicaID: 1, State: pb.State{Term: 2, Commit: 5}, EntriesToSave: []pb.Entry{{Index: 5, Term: 2, Cmd: []byte("fresh5")}}}, nil)
+				require.NoError(t, err)
+				require.NoError(t, owner.sync())
+			})
+			run(true, nil)
 		})
 	}
 }

@@ -106,6 +106,7 @@ package tan
 
 import (
 	"encoding/binary"
+	stderrors "errors"
 	"io"
 
 	"github.com/cockroachdb/errors"
@@ -145,8 +146,8 @@ var (
 	ErrInvalidChunk = errors.New("invalid chunk")
 	// ErrCRCMismatch is returned to indicate that CRC mismatch has been found.
 	ErrCRCMismatch = errors.New("tan: crc mismatch")
-	// ErrCorruptChunk is returned when a chunk's length runs past its block
-	// while valid chunks follow it: the log is corrupt in the middle, not
+	// ErrCorruptChunk is returned when a damaged chunk has valid chunks
+	// following it: the log is corrupt in the middle, not
 	// torn at the tail.
 	ErrCorruptChunk = errors.New("tan: corrupt chunk")
 )
@@ -155,6 +156,9 @@ var (
 // returned for invalid records. These are treated in a way similar to io.EOF
 // in recovery code.
 func IsInvalidRecord(err error) bool {
+	if stderrors.Is(err, errLogClose) {
+		return false
+	}
 	return errors.Is(err, ErrZeroedChunk) ||
 		errors.Is(err, ErrInvalidChunk) ||
 		errors.Is(err, io.ErrUnexpectedEOF)
@@ -227,6 +231,9 @@ func (r *reader) nextChunk(wantFirst bool) error {
 					r.err = ErrZeroedChunk
 					r.recover()
 					continue
+				}
+				if r.validChunkFollows(start) {
+					return ErrCorruptChunk
 				}
 				return ErrZeroedChunk
 			}

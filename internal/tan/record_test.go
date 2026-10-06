@@ -30,62 +30,46 @@ func big(partial string, n int) string {
 	return strings.Repeat(partial, n/len(partial)+1)[:n]
 }
 
-type recordWriter interface {
-	writeRecord([]byte) (int64, error)
-	close() error
-}
-
-func testGeneratorWriter(
-	t *testing.T,
-	reset func(),
-	gen func() (string, bool),
-	newWriter func(io.Writer) recordWriter,
-) {
-	buf := new(bytes.Buffer)
-
-	reset()
-	w := newWriter(buf)
-	for {
-		s, ok := gen()
-		if !ok {
-			break
-		}
-		if _, err := w.writeRecord([]byte(s)); err != nil {
-			t.Fatalf("Write: %v", err)
-		}
-	}
-	if err := w.close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	reset()
-	r := newReader(buf, 0 /* logNum */)
-	for {
-		s, ok := gen()
-		if !ok {
-			break
-		}
-		rr, err := r.next()
-		if err != nil {
-			t.Fatalf("reader.Next: %v", err)
-		}
-		x, err := io.ReadAll(rr)
-		if err != nil {
-			t.Fatalf("ReadAll: %v", err)
-		}
-		if string(x) != s {
-			t.Fatalf("got %q, want %q", short(string(x)), short(s))
-		}
-	}
-	if _, err := r.next(); err != io.EOF {
-		t.Fatalf("got %v, want %v", err, io.EOF)
-	}
-}
-
 func testGenerator(t *testing.T, reset func(), gen func() (string, bool)) {
 	t.Run("Writer", func(t *testing.T) {
-		testGeneratorWriter(t, reset, gen, func(w io.Writer) recordWriter {
-			return newWriter(w)
-		})
+		buf := new(bytes.Buffer)
+
+		reset()
+		w := newWriter(buf)
+		for {
+			s, ok := gen()
+			if !ok {
+				break
+			}
+			if _, err := w.writeRecord([]byte(s)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+		}
+		if err := w.close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		reset()
+		r := newReader(buf, 0 /* logNum */)
+		for {
+			s, ok := gen()
+			if !ok {
+				break
+			}
+			rr, err := r.next()
+			if err != nil {
+				t.Fatalf("reader.Next: %v", err)
+			}
+			x, err := io.ReadAll(rr)
+			if err != nil {
+				t.Fatalf("ReadAll: %v", err)
+			}
+			if string(x) != s {
+				t.Fatalf("got %q, want %q", short(string(x)), short(s))
+			}
+		}
+		if _, err := r.next(); err != io.EOF {
+			t.Fatalf("got %v, want %v", err, io.EOF)
+		}
 	})
 }
 
@@ -1001,4 +985,36 @@ func TestCRCMismatchLookAheadReadErrorStillFatal(t *testing.T) {
 	n, err = read(bytes.NewReader(build(false)))
 	require.Equal(t, 1, n)
 	require.True(t, IsInvalidRecord(err), "nothing follows: a torn tail, %v", err)
+}
+
+// Zeroed headers are repairable only when no valid records follow them.
+func TestZeroedHeaderTailVersusMiddle(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		index      int
+		tail       bool
+		laterBlock bool
+	}{
+		{"middle", 1, false, false}, {"last", 2, true, false}, {"middle before later block", 1, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			second := []byte("second")
+			if tc.laterBlock {
+				second = bytes.Repeat([]byte("x"), 2*blockSize+17)
+			}
+			data, offsets := writeTestLog(t, []byte("first"), second, []byte("third"))
+			for i := 0; i < legacyHeaderSize; i++ {
+				data[int(offsets[tc.index])+i] = 0
+			}
+			n, err := readAllRecords(data)
+			require.Equal(t, tc.index, n)
+			if tc.tail {
+				require.ErrorIs(t, err, ErrZeroedChunk)
+				require.True(t, IsInvalidRecord(err))
+			} else {
+				require.ErrorIs(t, err, ErrCorruptChunk)
+				require.False(t, IsInvalidRecord(err))
+			}
+		})
+	}
 }

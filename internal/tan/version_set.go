@@ -20,6 +20,7 @@ package tan
 
 import (
 	"bytes"
+	stderrors "errors"
 	"io"
 	"sync"
 
@@ -251,6 +252,13 @@ func (vs *versionSet) logAndApply(
 
 	currentVersion := vs.currentVersion()
 	var newVersion *version
+	installed := false
+	defer func() {
+		if newVersion != nil && !installed {
+			// Tentative references must not enqueue ambiguously published files.
+			newVersion.unrefFiles()
+		}
+	}()
 
 	// Generate a new manifest if we don't currently have one, or the current one
 	// is too large.
@@ -321,6 +329,7 @@ func (vs *versionSet) logAndApply(
 	}
 	// Install the new version.
 	vs.append(newVersion)
+	installed = true
 	if newManifestFileNum != 0 {
 		if vs.manifestFileNum != 0 {
 			vs.obsoleteManifests = append(vs.obsoleteManifests, vs.manifestFileNum)
@@ -340,15 +349,15 @@ func (vs *versionSet) createManifest(
 		manifestFile vfs.File
 		manifest     *writer
 	)
+	// A candidate not transferred into the manifest owner cannot be CURRENT.
 	defer func() {
-		if manifest != nil {
-			err = firstError(err, manifest.close())
-		}
 		if manifestFile != nil {
-			err = firstError(err, manifestFile.Close())
+			err = stderrors.Join(err, vs.fs.Remove(filename))
 		}
-		if err != nil {
-			err = firstError(err, vs.fs.Remove(filename))
+	}()
+	defer func() {
+		if manifestFile != nil {
+			err = stderrors.Join(err, manifestFile.Close())
 		}
 	}()
 	manifestFile, err = vs.fs.Create(filename)
@@ -381,17 +390,18 @@ func (vs *versionSet) createManifest(
 		return err
 	}
 
-	if vs.manifest != nil {
-		if err := vs.manifest.close(); err != nil {
-			return err
+	oldWriter, oldFile := vs.manifest, vs.manifestFile
+	vs.manifest, vs.manifestFile = nil, nil
+	if err := func() (err error) {
+		if oldFile != nil {
+			defer func() { err = stderrors.Join(err, oldFile.Close()) }()
 		}
-		vs.manifest = nil
-	}
-	if vs.manifestFile != nil {
-		if err := vs.manifestFile.Close(); err != nil {
-			return err
+		if oldWriter != nil {
+			return oldWriter.close()
 		}
-		vs.manifestFile = nil
+		return nil
+	}(); err != nil {
+		return err
 	}
 
 	vs.manifest, manifest = manifest, nil

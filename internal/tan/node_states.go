@@ -17,6 +17,7 @@ package tan
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
 
 	"github.com/lni/dragonboat/v4/raftio"
@@ -81,18 +82,14 @@ func (s *nodeStates) save(dirname string,
 	if err != nil {
 		return err
 	}
+	owned := true
 	defer func() {
-		err = firstError(err, file.Sync())
-		err = firstError(err, file.Close())
-		if err == nil {
-			err = fs.Rename(tmpFn, fn)
+		if owned {
+			err = errors.Join(err, file.Close())
 		}
-		err = firstError(err, dir.Sync())
 	}()
+
 	w := newWriter(file)
-	defer func() {
-		err = firstError(err, w.close())
-	}()
 	rw, err := w.next()
 	if err != nil {
 		return err
@@ -123,7 +120,6 @@ func (s *nodeStates) save(dirname string,
 		if err := n.currEntries.encode(rw); err != nil {
 			return err
 		}
-		n.currEntries = index{}
 		rw, err = w.next()
 		if err != nil {
 			return err
@@ -141,7 +137,27 @@ func (s *nodeStates) save(dirname string,
 			return err
 		}
 	}
-	return nil
+	if err := w.close(); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	owned = false
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := fs.Rename(tmpFn, fn); err != nil {
+		return err
+	}
+	return dir.Sync()
+}
+
+// retireCurrentEntries starts a fresh segment after the preceding one is durable.
+func (s *nodeStates) retireCurrentEntries() {
+	for _, node := range s.indexes {
+		node.currEntries = index{}
+	}
 }
 
 func (s *nodeStates) load(file io.ReadCloser) (err error) {

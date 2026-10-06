@@ -19,6 +19,7 @@
 package tan
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -66,19 +67,29 @@ func setCurrentFile(dirname string, fs vfs.FS, fileNum fileNum) (err error) {
 	if err != nil {
 		return err
 	}
+	owned := true
 	defer func() {
-		err = firstError(err, f.Sync())
-		err = firstError(err, f.Close())
-		if err == nil {
-			err = fs.Rename(oldFilename, newFilename)
+		if owned {
+			err = errors.Join(err, f.Close())
 		}
 	}()
+
 	v := []byte(fmt.Sprintf("MANIFEST-%s\n", fileNum))
 	w := newWriter(f)
-	defer func() {
-		err = firstError(err, w.close())
-	}()
 	if _, err = w.writeRecord(v); err != nil {
+		return err
+	}
+	if err := w.close(); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	owned = false
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := fs.Rename(oldFilename, newFilename); err != nil {
 		return err
 	}
 	return nil

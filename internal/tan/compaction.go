@@ -47,6 +47,9 @@ func (d *db) remove(shardID uint64, replicaID uint64, index uint64) error {
 }
 
 func (d *db) compactionLocked(index *nodeIndex) error {
+	if err := d.checkWritableLocked(); err != nil {
+		return err
+	}
 	if obsolete := index.compaction(); len(obsolete) > 0 {
 		obsolete = d.mu.nodeStates.getObsolete(obsolete)
 		if len(obsolete) > 0 {
@@ -56,8 +59,7 @@ func (d *db) compactionLocked(index *nodeIndex) error {
 			for _, fn := range obsolete {
 				ve.deletedFiles[deletedFileEntry{fn}] = &fileMetadata{fileNum: fn}
 			}
-			d.mu.versions.logLock()
-			if err := d.mu.versions.logAndApply(&ve, d.dataDir); err != nil {
+			if err := d.applyVersionEditLocked(&ve); err != nil {
 				return err
 			}
 		}
@@ -255,6 +257,9 @@ func (d *db) installSnapshot(shardID uint64,
 }
 
 func (d *db) removeAllLocked(shardID uint64, replicaID uint64, newLog bool) error {
+	if err := d.checkWritableLocked(); err != nil {
+		return err
+	}
 	if newLog {
 		if err := d.createNewLog(); err != nil {
 			return err
@@ -271,8 +276,7 @@ func (d *db) removeAllLocked(shardID uint64, replicaID uint64, newLog bool) erro
 			ve.deletedFiles[deletedFileEntry{fn}] = &fileMetadata{fileNum: fn}
 		}
 	}
-	d.mu.versions.logLock()
-	if err := d.mu.versions.logAndApply(&ve, d.dataDir); err != nil {
+	if err := d.applyVersionEditLocked(&ve); err != nil {
 		return err
 	}
 	d.updateReadStateLocked(nil)

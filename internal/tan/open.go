@@ -20,6 +20,7 @@ package tan
 
 import (
 	"context"
+	stderrors "errors"
 	"sort"
 	"time"
 
@@ -31,7 +32,7 @@ import (
 )
 
 // open opens the tan db located in the folder called dirname.
-func open(shardID, replicaID uint64, name string, dirname string, opts *Options) (*db, error) {
+func open(shardID, replicaID uint64, name string, dirname string, opts *Options) (_ *db, err error) {
 	opts = opts.EnsureDefaults()
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &db{
@@ -43,15 +44,26 @@ func open(shardID, replicaID uint64, name string, dirname string, opts *Options)
 		dirname:          dirname,
 		deleteObsoleteCh: make(chan struct{}, 1),
 		stopper:          syncutil.NewStopper(),
-		archiver:         newArchiver(ctx, opts.archiveIO, dirname, opts.FS),
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			if cleanupErr := d.close(); cleanupErr != nil {
+				if err != nil {
+					err = stderrors.Join(err, cleanupErr)
+				} else {
+					plog.Errorf("Tan constructor rollback: %v", cleanupErr)
+				}
+			}
+		}
+	}()
+	d.archiver = newArchiver(ctx, opts.archiveIO, dirname, opts.FS)
 	d.mu.versions = &versionSet{}
 	d.mu.nodeStates = newNodeStates()
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	var err error
 	d.dataDir, err = opts.FS.OpenDir(dirname)
 	if err != nil {
 		return nil, err
@@ -81,87 +93,46 @@ func open(shardID, replicaID uint64, name string, dirname string, opts *Options)
 		return nil, err
 	}
 	plog.Infof("%s on disk files %v", d.id(), ls)
-	type fileNumAndName struct {
-		num  fileNum
-		name string
-	}
 	currentVersion := d.mu.versions.currentVersion()
-	var indexFiles []fileNumAndName
-	logFiles := make(map[fileNum]fileNumAndName)
-	lastLogNum := fileNum(0)
 	for _, filename := range ls {
 		ft, fn, ok := parseFilename(opts.FS, filename)
 		if !ok {
 			continue
 		}
-		// Don't reuse any obsolete file numbers
 		if d.mu.versions.nextFileNum <= fn {
 			d.mu.versions.nextFileNum = fn + 1
 		}
-
 		switch ft {
-		case fileTypeLog:
-			if _, ok := currentVersion.files[fn]; ok {
-				if fn > lastLogNum {
-					lastLogNum = fn
-				}
-				logFiles[fn] = fileNumAndName{fn, filename}
-			}
-		case fileTypeLogTemp:
-			fallthrough
-		case fileTypeBootstrapTemp:
-			fallthrough
-		case fileTypeIndexTemp:
-			fallthrough
-		case fileTypeTemp:
+		case fileTypeLogTemp, fileTypeBootstrapTemp, fileTypeIndexTemp, fileTypeTemp:
 			if err := opts.FS.Remove(opts.FS.PathJoin(dirname, filename)); err != nil {
 				return nil, err
 			}
-		case fileTypeIndex:
-			if _, ok := currentVersion.files[fn]; ok {
-				indexFiles = append(indexFiles, fileNumAndName{fn, filename})
-			}
 		}
 	}
-	sort.Slice(indexFiles, func(i, j int) bool {
-		return indexFiles[i].num < indexFiles[j].num
-	})
-	for _, indexFile := range indexFiles {
-		if _, ok := logFiles[indexFile.num]; !ok {
-			plog.Panicf("log file %d missing", indexFile.num)
-		}
-		file, openErr := opts.FS.Open(makeFilename(opts.FS, dirname, fileTypeIndex, indexFile.num))
-		if openErr != nil {
-			return nil, openErr
-		}
-		if err := d.mu.nodeStates.load(file); err != nil {
-			_ = file.Close()
-			// TODO: we can actually regenerate the index when it is corrupted
+	logs := make([]fileNum, 0, len(currentVersion.files))
+	for number := range currentVersion.files {
+		logs = append(logs, number)
+	}
+	sort.Slice(logs, func(i, j int) bool { return logs[i] < logs[j] })
+	for i, number := range logs {
+		if err := func() (err error) {
+			file, err := opts.FS.Open(makeFilename(opts.FS, dirname, fileTypeIndex, number))
+			if oserror.IsNotExist(err) {
+				return d.rebuildLogAndIndex(number, i == len(logs)-1)
+			}
+			if err != nil {
+				return err
+			}
+			defer func() { err = stderrors.Join(err, file.Close()) }()
+			return d.mu.nodeStates.load(file)
+		}(); err != nil {
 			return nil, err
-		}
-		closeErr := file.Close()
-		if closeErr != nil {
-			return nil, closeErr
-		}
-		delete(logFiles, indexFile.num)
-	}
-	plog.Infof("%s logFiles to rebuild: %v", d.id(), logFiles)
-	plog.Infof("%s indexFiles: %v", d.id(), indexFiles)
-	for _, lf := range logFiles {
-		if len(indexFiles) == 0 || lf.num > indexFiles[len(indexFiles)-1].num {
-			if lf.num != lastLogNum {
-				plog.Panicf("more than one log file have index missing")
-			}
-			if err := d.rebuildLogAndIndex(lf.num); err != nil {
-				return nil, err
-			}
 		}
 	}
 
 	if err := d.createNewLog(); err != nil {
 		return nil, err
 	}
-	d.updateReadStateLocked(nil)
 
 	// indexes are populated when d.mu.state.load() is called above
 	for _, index := range d.mu.nodeStates.indexes {
@@ -180,6 +151,7 @@ func open(shardID, replicaID uint64, name string, dirname string, opts *Options)
 	})
 	d.scanObsoleteFiles(ls)
 	d.notifyDeleteObsoleteWorker()
+	completed = true
 	return d, nil
 }
 
@@ -187,11 +159,9 @@ func (d *db) id() string {
 	return d.name
 }
 
-func (d *db) createNewLog() error {
-	if d.mu.logFile != nil {
-		if err := d.mu.logFile.Close(); err != nil {
-			return err
-		}
+func (d *db) createNewLog() (err error) {
+	if err := d.checkWritableLocked(); err != nil {
+		return err
 	}
 	logNum := d.mu.versions.getNextFileNum()
 	logName := makeFilename(d.opts.FS, d.dirname, fileTypeLog, logNum)
@@ -199,51 +169,86 @@ func (d *db) createNewLog() error {
 	if err != nil {
 		return err
 	}
+	owned, manifestAttempted := true, false
+	defer func() {
+		if owned && !manifestAttempted {
+			err = stderrors.Join(err, d.opts.FS.Remove(logName))
+		}
+	}()
+	defer func() {
+		if owned {
+			err = stderrors.Join(err, logFile.Close())
+		}
+	}()
 	if err := prealloc(logFile, d.opts.MaxLogFileSize+indexBlockSize, d.opts.DisablePrealloc); err != nil {
+		return err
+	}
+	if err := logFile.Sync(); err != nil {
 		return err
 	}
 	if err := d.dataDir.Sync(); err != nil {
 		return err
 	}
-	d.mu.logFile = logFile
-	d.mu.logWriter = newWriter(logFile)
-	d.mu.logNum = logNum
-	d.mu.offset = 0
-	ve := versionEdit{
-		newFiles: []newFileEntry{{meta: &fileMetadata{fileNum: logNum}}},
+	nextWriter := newWriter(logFile)
+	oldFile := d.mu.logFile
+	if oldFile != nil {
+		if err := d.sealCurrentLogLocked(); err != nil {
+			return err
+		}
+		if err := d.saveIndex(); err != nil {
+			return err
+		}
 	}
-	d.mu.versions.logLock()
-	err = d.mu.versions.logAndApply(&ve, d.dataDir)
-	if err != nil {
+	ve := versionEdit{newFiles: []newFileEntry{{meta: &fileMetadata{fileNum: logNum}}}}
+	manifestAttempted = true
+	if err := d.applyVersionEditLocked(&ve); err != nil {
 		return err
 	}
-	// Update the local ARCHIVE file when the file is created, set commit to false here;
-	// set it to true after the log file and index file are written to remote storage.
-	item := config.RecordItem{
-		FileNum:  uint64(d.mu.logNum),
-		TS:       time.Now(),
-		FirstLsn: d.mu.lsn + 1,
+	d.mu.logFile, d.mu.logWriter = logFile, nextWriter
+	d.mu.logNum, d.mu.offset = logNum, 0
+	owned = false
+	if oldFile != nil {
+		defer func() { err = stderrors.Join(err, oldFile.Close()) }()
 	}
-	d.archiver.addItem(item)
+	d.mu.nodeStates.retireCurrentEntries()
+	d.updateReadStateLocked(nil)
+	d.archiver.addItem(config.RecordItem{FileNum: uint64(logNum), TS: time.Now(), FirstLsn: d.mu.lsn + 1})
 	return nil
 }
 
-func (d *db) rebuildLogAndIndex(logNum fileNum) (err error) {
+func (d *db) rebuildLogAndIndex(logNum fileNum, allowTailRepair bool) (err error) {
 	plog.Infof("%s rebuildLogAndIndex, logNum %d", d.id(), logNum)
 	f := func(u pb.Update, offset int64) bool {
 		d.updateIndex(u, offset, logNum)
 		return true
 	}
 	if err := d.readLog(indexEntry{fileNum: logNum}, f); err != nil {
-		if !IsInvalidRecord(err) {
+		if !allowTailRepair || !IsInvalidRecord(err) {
 			return err
 		}
 		if err := d.rebuildLog(logNum); err != nil {
 			return err
 		}
+	} else {
+		// Valid bytes may still be an unsynced suffix from the preceding run.
+		// The rebuilt index must not become durable before its source log.
+		if err := func() (err error) {
+			name := makeFilename(d.opts.FS, d.dirname, fileTypeLog, logNum)
+			file, err := d.opts.FS.Open(name)
+			if err != nil {
+				return err
+			}
+			defer func() { err = stderrors.Join(err, file.Close()) }()
+			return file.Sync()
+		}(); err != nil {
+			return err
+		}
 	}
-	// save to index file
-	return d.mu.nodeStates.save(d.dirname, d.dataDir, logNum, d.opts.FS)
+	if err := d.mu.nodeStates.save(d.dirname, d.dataDir, logNum, d.opts.FS); err != nil {
+		return err
+	}
+	d.mu.nodeStates.retireCurrentEntries()
+	return nil
 }
 
 func (d *db) rebuildLog(logNum fileNum) (err error) {
@@ -272,9 +277,9 @@ func (d *db) rebuildLog(logNum fileNum) (err error) {
 			return
 		}
 		if f != nil {
-			_ = f.Close()
+			err = stderrors.Join(err, f.Close())
 		}
-		_ = d.opts.FS.Remove(fn)
+		err = stderrors.Join(err, d.opts.FS.Remove(fn))
 	}()
 	w := newWriter(f)
 	buf := make([]byte, defaultBufferSize)
@@ -311,8 +316,9 @@ func (d *db) rebuildLog(logNum fileNum) (err error) {
 	if err := f.Sync(); err != nil {
 		return err
 	}
-	cerr := f.Close()
+	closing := f
 	f = nil
+	cerr := closing.Close()
 	if cerr != nil {
 		return cerr
 	}
@@ -323,11 +329,15 @@ func (d *db) rebuildLog(logNum fileNum) (err error) {
 	return d.dataDir.Sync()
 }
 
-func (d *db) saveIndex() error {
-	return d.mu.nodeStates.save(d.dirname, d.dataDir, d.mu.logNum, d.opts.FS)
+func (d *db) saveIndex() (err error) {
+	completed := false
+	defer func() { d.finishPersistenceLocked(err, completed) }()
+	err = d.mu.nodeStates.save(d.dirname, d.dataDir, d.mu.logNum, d.opts.FS)
+	completed = true
+	return err
 }
 
-func (d *db) close() error {
+func (d *db) close() (err error) {
 	d.cancel()
 	d.stopper.Stop()
 	d.mu.Lock()
@@ -338,18 +348,37 @@ func (d *db) close() error {
 	d.closed.Store(errors.WithStack(ErrClosed))
 	close(d.closedCh)
 
-	var err error
-	err = firstError(err, d.mu.logWriter.close())
-	err = firstError(err, d.saveIndex())
-	// Note that versionSet.close() only closes the MANIFEST. The versions list
-	// is still valid for the checks below.
-	err = firstError(err, d.mu.versions.close())
-	plog.Infof("%s is being closed, logNum %d", d.id(), d.mu.logNum)
-	err = firstError(err, d.mu.logFile.Close())
-	err = firstError(err, d.dataDir.Close())
-
-	if err == nil {
-		d.readState.val.unrefLocked()
+	// Arm each remaining owner independently before persistence callbacks.
+	if d.readState.val != nil {
+		defer d.readState.val.unrefLocked()
 	}
-	return err
+	if d.dataDir != nil {
+		defer func() {
+			file := d.dataDir
+			d.dataDir = nil
+			err = stderrors.Join(err, file.Close())
+		}()
+	}
+	if d.mu.logFile != nil {
+		defer func() {
+			file := d.mu.logFile
+			d.mu.logFile, d.mu.logWriter = nil, nil
+			err = stderrors.Join(err, file.Close())
+		}()
+	}
+	if d.mu.versions != nil {
+		defer func() { err = stderrors.Join(err, d.mu.versions.close()) }()
+	}
+	if d.mu.persistenceErr != nil {
+		return d.mu.persistenceErr
+	}
+	if d.mu.logWriter != nil {
+		if err := d.sealCurrentLogLocked(); err != nil {
+			return err
+		}
+	}
+	if d.readState.val != nil {
+		return d.saveIndex()
+	}
+	return nil
 }

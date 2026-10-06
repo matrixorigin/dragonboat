@@ -21,6 +21,7 @@ package tan
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"math"
@@ -55,7 +56,8 @@ var (
 	// bootstrap record
 	ErrNoBootstrap = errors.New("no bootstrap info")
 	// ErrNoState is the error indicating that there is no state record in the db
-	ErrNoState = errors.New("no state record")
+	ErrNoState                = errors.New("no state record")
+	errPersistenceInterrupted = errors.New("Tan persistence interrupted; reopen required")
 )
 
 // db is basically an instance of the core tan storage, it holds required
@@ -83,13 +85,14 @@ type db struct {
 	// where/how log data is maintained
 	mu struct {
 		sync.Mutex
-		offset     int64
-		logNum     fileNum
-		logFile    vfs.File
-		logWriter  *writer
-		versions   *versionSet
-		nodeStates *nodeStates
-		lsn        uint64
+		offset         int64
+		logNum         fileNum
+		logFile        vfs.File
+		logWriter      *writer
+		versions       *versionSet
+		nodeStates     *nodeStates
+		lsn            uint64
+		persistenceErr error
 	}
 
 	// archiver is used to archive the log files.
@@ -117,6 +120,9 @@ func (d *db) write(u pb.Update, buf []byte) (bool, error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := d.checkWritableLocked(); err != nil {
+		return false, err
+	}
 	st := d.mu.nodeStates.getState(u.ShardID, u.ReplicaID)
 	if pb.IsStateEqual(u.State, st) &&
 		pb.IsEmptySnapshot(u.Snapshot) && len(u.EntriesToSave) == 0 {
@@ -127,10 +133,35 @@ func (d *db) write(u pb.Update, buf []byte) (bool, error) {
 	return sync, d.doWriteLocked(u, data)
 }
 
-func (d *db) doWriteLocked(u pb.Update, data []byte) error {
+func (d *db) checkWritableLocked() error {
+	if err := d.closed.Load(); err != nil {
+		return err.(error)
+	}
+	return d.mu.persistenceErr
+}
+
+// finishPersistenceLocked preserves the first uncertain storage outcome.
+func (d *db) finishPersistenceLocked(err error, completed bool) {
+	if d.mu.persistenceErr != nil {
+		return
+	}
+	if !completed && err == nil {
+		err = errPersistenceInterrupted
+	}
+	if err != nil {
+		d.mu.persistenceErr = err
+	}
+}
+
+func (d *db) doWriteLocked(u pb.Update, data []byte) (err error) {
+	if err := d.checkWritableLocked(); err != nil {
+		return err
+	}
 	if err := d.makeRoomForWrite(); err != nil {
 		return err
 	}
+	completed := false
+	defer func() { d.finishPersistenceLocked(err, completed) }()
 	offset, err := d.mu.logWriter.writeRecord(data)
 	if err != nil {
 		return err
@@ -138,12 +169,46 @@ func (d *db) doWriteLocked(u pb.Update, data []byte) error {
 	d.updateIndex(u, d.mu.offset, d.mu.logNum)
 	d.mu.offset = offset
 	d.mu.nodeStates.setState(u.ShardID, u.ReplicaID, u.State)
+	completed = true
 	return nil
 }
 
-// sync issues a fsync() operation on the underlying log file.
-func (d *db) sync() error {
-	return d.mu.logFile.Sync()
+// sync keeps the descriptor borrow inside the owner's mutation lock.
+func (d *db) sync() (err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.checkWritableLocked(); err != nil {
+		return err
+	}
+	completed := false
+	defer func() { d.finishPersistenceLocked(err, completed) }()
+	err = d.mu.logFile.Sync()
+	completed = true
+	return err
+}
+
+// sealCurrentLogLocked is shared by rotation and healthy destruction.
+func (d *db) sealCurrentLogLocked() (err error) {
+	completed := false
+	defer func() { d.finishPersistenceLocked(err, completed) }()
+	if err := d.mu.logWriter.close(); err != nil {
+		return err
+	}
+	err = d.mu.logFile.Sync()
+	completed = true
+	return err
+}
+
+func (d *db) applyVersionEditLocked(edit *versionEdit) (err error) {
+	if err := d.checkWritableLocked(); err != nil {
+		return err
+	}
+	completed := false
+	defer func() { d.finishPersistenceLocked(err, completed) }()
+	d.mu.versions.logLock()
+	err = d.mu.versions.logAndApply(edit, d.dataDir)
+	completed = true
+	return err
 }
 
 // updateIndex records the fileNum and position of the written update into the
@@ -194,15 +259,8 @@ func (d *db) makeRoomForWrite() error {
 	return d.switchToNewLog()
 }
 
-// switchToNewLog flushes the index of the current log file to disk, update the
-// readState hold by the db and then switch to a new log file.
-func (d *db) switchToNewLog() error {
-	if err := d.saveIndex(); err != nil {
-		return err
-	}
-	defer d.updateReadStateLocked(nil)
-	return d.createNewLog()
-}
+// switchToNewLog delegates segment publication to its common owner.
+func (d *db) switchToNewLog() error { return d.createNewLog() }
 
 // getSnapshot returns the latest snapshot in the db. we record all seen
 // snapshots into the db, but will only query for the most recent snapshot
@@ -482,6 +540,8 @@ func (d *db) getEntriesWithMultiplexed(shardID uint64, replicaID uint64,
 	return entries, size, nil
 }
 
+var errLogClose = stderrors.New("tan: log source Close failed")
+
 // readLog queries the db for the saved pb.Update record identified by the
 // specified indexEntry parameter. For each encountered pb.Update record,
 // h will be invoked with the encountered pb.Update value passed to it.
@@ -511,7 +571,9 @@ func (d *db) readLog(ie indexEntry,
 		}
 	}
 	defer func() {
-		err = firstError(err, f.Close())
+		if closeErr := f.Close(); closeErr != nil {
+			err = stderrors.Join(err, stderrors.Join(errLogClose, closeErr))
+		}
 	}()
 	rr := newReader(f, ie.fileNum)
 	if ie.pos > 0 {
