@@ -15,6 +15,7 @@
 package logdb
 
 import (
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -1008,60 +1009,6 @@ func TestSaveEntriesWithIndexGap(t *testing.T) {
 	runLogDBTest(t, tf, fs)
 }
 
-func testAllWantedEntriesAreAccessible(t *testing.T, first uint64, last uint64) {
-	tf := func(t *testing.T, db raftio.ILogDB) {
-		shardID := uint64(0)
-		replicaID := uint64(4)
-		ents := make([]pb.Entry, 0)
-		for i := first; i <= last; i++ {
-			e := pb.Entry{
-				Term:  1,
-				Index: i,
-				Type:  pb.ApplicationEntry,
-			}
-			ents = append(ents, e)
-		}
-		ud := pb.Update{
-			EntriesToSave: ents,
-			State:         pb.State{Commit: 1},
-			ShardID:       shardID,
-			ReplicaID:     replicaID,
-		}
-		err := db.SaveRaftState([]pb.Update{ud}, 1)
-		if err != nil {
-			t.Fatalf("failed to save recs")
-		}
-		results, _, err := db.IterateEntries(nil,
-			0, shardID, replicaID, first, last+1, math.MaxUint64)
-		if err != nil {
-			t.Errorf("failed to get entries %v", err)
-		}
-		if uint64(len(results)) != last-first+1 {
-			t.Errorf("got %d entries, want %d", len(results), last-first+1)
-		}
-		if results[len(results)-1].Index != last {
-			t.Errorf("last index %d, want %d", results[len(results)-1].Index, last)
-		}
-		if results[0].Index != first {
-			t.Errorf("first index %d, want %d", results[0].Index, first)
-		}
-		rs, err := db.ReadRaftState(shardID, replicaID, first-1)
-		if err != nil {
-			t.Fatalf("failed to get entry range %v", err)
-		}
-		firstIndex := rs.FirstIndex
-		length := rs.EntryCount
-		if firstIndex != first {
-			t.Errorf("first index %d, want %d", firstIndex, first)
-		}
-		if length != last-first+1 {
-			t.Errorf("length %d, want %d", length, last-first+1)
-		}
-	}
-	fs := vfs.GetTestFS()
-	runLogDBTest(t, tf, fs)
-}
-
 func TestRemoveEntriesTo(t *testing.T) {
 	fs := vfs.GetTestFS()
 	defer leaktest.AfterTest(t)()
@@ -1167,23 +1114,43 @@ func TestRemoveEntriesTo(t *testing.T) {
 }
 
 func TestAllWantedEntriesAreAccessible(t *testing.T) {
-	testAllWantedEntriesAreAccessible(t, 1, 2)
-	testAllWantedEntriesAreAccessible(t, 3, batchSize/2)
-	testAllWantedEntriesAreAccessible(t, 1, batchSize-1)
-	testAllWantedEntriesAreAccessible(t, 1, batchSize)
-	testAllWantedEntriesAreAccessible(t, 1, batchSize+1)
-	testAllWantedEntriesAreAccessible(t, 1, batchSize*3-1)
-	testAllWantedEntriesAreAccessible(t, 1, batchSize*3)
-	testAllWantedEntriesAreAccessible(t, 1, batchSize*3+1)
-	testAllWantedEntriesAreAccessible(t, batchSize-1, batchSize*3-1)
-	testAllWantedEntriesAreAccessible(t, batchSize, batchSize*3-1)
-	testAllWantedEntriesAreAccessible(t, batchSize+1, batchSize*3-1)
-	testAllWantedEntriesAreAccessible(t, batchSize-1, batchSize*3)
-	testAllWantedEntriesAreAccessible(t, batchSize, batchSize*3)
-	testAllWantedEntriesAreAccessible(t, batchSize+1, batchSize*3)
-	testAllWantedEntriesAreAccessible(t, batchSize-1, batchSize*3+1)
-	testAllWantedEntriesAreAccessible(t, batchSize, batchSize*3+1)
-	testAllWantedEntriesAreAccessible(t, batchSize+1, batchSize*3+1)
+	ranges := []struct{ first, last uint64 }{
+		{1, 2}, {3, batchSize / 2},
+		{1, batchSize - 1}, {1, batchSize}, {1, batchSize + 1},
+		{1, batchSize*3 - 1}, {1, batchSize * 3}, {1, batchSize*3 + 1},
+		{batchSize - 1, batchSize*3 - 1}, {batchSize, batchSize*3 - 1}, {batchSize + 1, batchSize*3 - 1},
+		{batchSize - 1, batchSize * 3}, {batchSize, batchSize * 3}, {batchSize + 1, batchSize * 3},
+		{batchSize - 1, batchSize*3 + 1}, {batchSize, batchSize*3 + 1}, {batchSize + 1, batchSize*3 + 1},
+	}
+	for _, batched := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batched=%t", batched), func(t *testing.T) {
+			runLogDBTestAs(t, batched, func(t *testing.T, db raftio.ILogDB) {
+				for caseID, bounds := range ranges {
+					t.Run(fmt.Sprintf("%d-%d", bounds.first, bounds.last), func(t *testing.T) {
+						// Each case starts with an empty replica namespace in the shared owner.
+						shardID, replicaID := uint64(0), uint64(caseID+4)
+						ents := make([]pb.Entry, 0, bounds.last-bounds.first+1)
+						for index := bounds.first; index <= bounds.last; index++ {
+							ents = append(ents, pb.Entry{Term: 1, Index: index, Type: pb.ApplicationEntry})
+						}
+						require.NoError(t, db.SaveRaftState([]pb.Update{{EntriesToSave: ents, State: pb.State{Commit: 1}, ShardID: shardID, ReplicaID: replicaID}}, 1))
+						results, _, err := db.IterateEntries(nil, 0, shardID, replicaID, bounds.first, bounds.last+1, math.MaxUint64)
+						require.NoError(t, err)
+						require.Len(t, results, int(bounds.last-bounds.first+1))
+						for offset, entry := range results {
+							require.Equal(t, bounds.first+uint64(offset), entry.Index)
+							require.Equal(t, uint64(1), entry.Term)
+							require.Equal(t, pb.ApplicationEntry, entry.Type)
+						}
+						state, err := db.ReadRaftState(shardID, replicaID, bounds.first-1)
+						require.NoError(t, err)
+						require.Equal(t, bounds.first, state.FirstIndex)
+						require.Equal(t, bounds.last-bounds.first+1, state.EntryCount)
+					})
+				}
+			}, vfs.GetTestFS())
+		})
+	}
 }
 
 type noopCompactor struct{}
