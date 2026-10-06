@@ -318,9 +318,19 @@ func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
 	nh := &NodeHost{
 		env:      env,
 		nhConfig: nhConfig,
-		stopper:  syncutil.NewStopper(),
 		fs:       nhConfig.Expert.FS,
 	}
+	initialized := false
+	defer func() {
+		if !initialized {
+			// Roll back errors, panics and Goexit without recovering or replacing
+			// the original failure. Close errors are secondary during acquisition.
+			if err := nh.close(); err != nil {
+				plog.Errorf("failed to close partially initialized NodeHost: %v", err)
+			}
+		}
+	}()
+	nh.stopper = syncutil.NewStopper()
 	// make static check happy
 	_ = nh.partitioned
 	nh.events.raft = nhConfig.RaftEventListener
@@ -337,27 +347,16 @@ func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
 	}
 	nh.msgHandler = newNodeHostMessageHandler(nh)
 	nh.createPools()
-	defer func() {
-		if r := recover(); r != nil {
-			nh.Close()
-			if r, ok := r.(error); ok {
-				panicNow(r)
-			}
-		}
-	}()
 	did := nh.nhConfig.GetDeploymentID()
 	plog.Infof("DeploymentID set to %d", did)
 	if err := nh.createLogDB(); err != nil {
-		nh.Close()
 		return nil, err
 	}
 	if err := nh.loadNodeHostID(); err != nil {
-		nh.Close()
 		return nil, err
 	}
 	plog.Infof("NodeHost ID: %s", nh.id.String())
 	if err := nh.createNodeRegistry(); err != nil {
-		nh.Close()
 		return nil, err
 	}
 	errorInjection := false
@@ -368,7 +367,6 @@ func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
 	nh.engine = newExecEngine(nh, nhConfig.Expert.Engine,
 		nh.nhConfig.NotifyCommit, errorInjection, nh.env, nh.mu.logdb)
 	if err := nh.createTransport(); err != nil {
-		nh.Close()
 		return nil, err
 	}
 	nh.stopper.RunWorker(func() {
@@ -378,15 +376,25 @@ func NewNodeHost(nhConfig config.NodeHostConfig) (*NodeHost, error) {
 		nh.tickWorkerMain()
 	})
 	nh.logNodeHostDetails()
+	initialized = true
 	return nh, nil
 }
 
 // Close stops all managed Raft nodes and releases all resources owned by the
 // NodeHost instance.
 func (nh *NodeHost) Close() {
-	nh.events.sys.Publish(server.SystemEvent{
-		Type: server.NodeHostShuttingDown,
-	})
+	if err := nh.close(); err != nil {
+		panicNow(err)
+	}
+}
+
+// close is the single destruction path for both published and partial hosts.
+func (nh *NodeHost) close() error {
+	if nh.events.sys != nil {
+		nh.events.sys.Publish(server.SystemEvent{
+			Type: server.NodeHostShuttingDown,
+		})
+	}
 	nh.mu.Lock()
 	if atomic.LoadInt32(&nh.closed) != 0 {
 		panic("NodeHost.Stop called twice")
@@ -408,7 +416,9 @@ func (nh *NodeHost) Close() {
 		}
 	}
 	plog.Debugf("%s is stopping the nh stopper", nh.describe())
-	nh.stopper.Stop()
+	if nh.stopper != nil {
+		nh.stopper.Stop()
+	}
 	var err error
 	plog.Debugf("%s is stopping the tranport module", nh.describe())
 	if nh.transport != nil {
@@ -430,11 +440,11 @@ func (nh *NodeHost) Close() {
 		nh.mu.logdb = nil
 	}
 	plog.Debugf("%s is stopping the env module", nh.describe())
-	err = firstError(err, nh.env.Close())
-	plog.Debugf("NodeHost %s stopped", nh.describe())
-	if err != nil {
-		panicNow(err)
+	if nh.env != nil {
+		err = firstError(err, nh.env.Close())
 	}
+	plog.Debugf("NodeHost %s stopped", nh.describe())
+	return err
 }
 
 // NodeHostConfig returns the NodeHostConfig instance used for configuring this
