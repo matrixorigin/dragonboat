@@ -15,6 +15,7 @@
 package tee
 
 import (
+	stderrors "errors"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -89,16 +90,31 @@ func newKVLogDB(nhConfig config.NodeHostConfig,
 // based ILogDB.
 func NewTeeLogDB(nhConfig config.NodeHostConfig,
 	cb config.LogDBCallback,
-	dirs []string, wals []string) (raftio.ILogDB, error) {
+	dirs []string, wals []string) (_ raftio.ILogDB, err error) {
 	odb, err := NewTanLogDB(nhConfig, cb, dirs, wals)
 	if err != nil {
 		return nil, err
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			cleanupErr := odb.Close()
+			if cleanupErr != nil {
+				if err != nil {
+					err = stderrors.Join(err, cleanupErr)
+				} else {
+					plog.Errorf("Tee constructor rollback: %v", cleanupErr)
+				}
+			}
+		}
+	}()
 	ndb, err := NewPebbleLogDB(nhConfig, cb, dirs, wals)
 	if err != nil {
 		return nil, err
 	}
-	return MakeTeeLogDB(odb, ndb), nil
+	result := MakeTeeLogDB(odb, ndb)
+	completed = true
+	return result, nil
 }
 
 // MakeTeeLogDB returns a LogDB instance combined from the specified odb and
@@ -117,12 +133,12 @@ func (t *LogDB) Name() string {
 }
 
 // Close ...
-func (t *LogDB) Close() error {
+func (t *LogDB) Close() (err error) {
+	// Register the remaining owner before entering the first store's callback.
+	// A panic or Goexit must not abandon the second store.
+	defer func() { err = stderrors.Join(err, t.ndb.Close()) }()
 	t.stopper.Stop()
-	if err := t.odb.Close(); err != nil {
-		return nil
-	}
-	return t.ndb.Close()
+	return t.odb.Close()
 }
 
 // BinaryFormat ...

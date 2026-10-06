@@ -15,6 +15,7 @@
 package logdb
 
 import (
+	stderrors "errors"
 	"fmt"
 	"math"
 	"sync/atomic"
@@ -61,7 +62,7 @@ func (sc *shardCallback) callback(busy bool) {
 // OpenShardedDB creates a ShardedDB instance.
 func OpenShardedDB(config config.NodeHostConfig, cb config.LogDBCallback,
 	dirs []string, lldirs []string, batched bool, check bool,
-	kvf kv.Factory) (*ShardedDB, error) {
+	kvf kv.Factory) (_ *ShardedDB, err error) {
 	fs := config.Expert.FS
 	if config.Expert.LogDB.IsEmpty() {
 		panic("config.Expert.LogDB.IsEmpty()")
@@ -69,17 +70,19 @@ func OpenShardedDB(config config.NodeHostConfig, cb config.LogDBCallback,
 	if check && batched {
 		plog.Panicf("check and batched both set")
 	}
-	shards := make([]*db, 0)
-	closeAll := func(all []*db) {
-		var err error
-		for _, s := range all {
-			err = firstError(err, s.close())
+	mw := &ShardedDB{config: config.Expert.LogDB}
+	completed := false
+	defer func() {
+		if !completed {
+			if cleanupErr := mw.Close(); cleanupErr != nil {
+				if err != nil {
+					err = stderrors.Join(err, cleanupErr)
+				} else {
+					plog.Errorf("ShardedDB constructor rollback: %v", cleanupErr)
+				}
+			}
 		}
-		if err != nil {
-			plog.Panicf("%+v", err)
-			panic("not suppose to reach here")
-		}
-	}
+	}()
 	for i := uint64(0); i < config.Expert.LogDB.Shards; i++ {
 		dir := fs.PathJoin(dirs[i], fmt.Sprintf("logdb-%d", i))
 		lldir := ""
@@ -90,20 +93,23 @@ func OpenShardedDB(config config.NodeHostConfig, cb config.LogDBCallback,
 		db, err := openRDB(config.Expert.LogDB,
 			sc.callback, dir, lldir, batched, fs, kvf)
 		if err != nil {
-			closeAll(shards)
 			return nil, errors.WithStack(err)
 		}
-		shards = append(shards, db)
+		mw.shards = append(mw.shards, db)
 	}
 	if check && !batched {
-		for _, s := range shards {
+		for _, s := range mw.shards {
 			located, err := hasEntryRecord(s.kvs, true)
 			if err != nil {
-				closeAll(shards)
 				return nil, errors.WithStack(err)
 			}
 			if located {
-				closeAll(shards)
+				// Close consumes this generation even if a destructor exits abnormally.
+				completed = true
+				cleanupErr := mw.Close()
+				if cleanupErr != nil {
+					return nil, cleanupErr
+				}
 				return OpenShardedDB(config, cb, dirs, lldirs, true, false, kvf)
 			}
 		}
@@ -113,23 +119,19 @@ func OpenShardedDB(config config.NodeHostConfig, cb config.LogDBCallback,
 	} else {
 		plog.Infof("using plain logdb")
 	}
-	partitioner := server.NewDoubleFixedPartitioner(config.Expert.Engine.ExecShards,
+	mw.partitioner = server.NewDoubleFixedPartitioner(config.Expert.Engine.ExecShards,
 		config.Expert.LogDB.Shards)
-	mw := &ShardedDB{
-		config:       config.Expert.LogDB,
-		shards:       shards,
-		ctxs:         make([]IContext, config.Expert.Engine.ExecShards),
-		partitioner:  partitioner,
-		compactions:  newCompactions(),
-		compactionCh: make(chan struct{}, 1),
-		stopper:      syncutil.NewStopper(),
-	}
+	mw.ctxs = make([]IContext, config.Expert.Engine.ExecShards)
+	mw.compactions = newCompactions()
+	mw.compactionCh = make(chan struct{}, 1)
+	mw.stopper = syncutil.NewStopper()
 	for i := uint64(0); i < config.Expert.Engine.ExecShards; i++ {
 		mw.ctxs[i] = newContext(mw.config.SaveBufferSize, mw.config.MaxSaveBufferSize)
 	}
 	mw.stopper.RunWorker(func() {
 		mw.compactionWorkerMain()
 	})
+	completed = true
 	return mw, nil
 }
 
@@ -285,12 +287,19 @@ func (s *ShardedDB) ImportSnapshot(ss pb.Snapshot, replicaID uint64) error {
 
 // Close closes the ShardedDB instance.
 func (s *ShardedDB) Close() (err error) {
-	s.stopper.Stop()
-	for _, v := range s.shards {
-		err = firstError(err, v.close())
+	// Arm every acquired owner before invoking a destructor. Deferred cleanup
+	// preserves store-before-context order even when a store exits abnormally.
+	for i := len(s.ctxs) - 1; i >= 0; i-- {
+		if s.ctxs[i] != nil {
+			defer s.ctxs[i].Destroy()
+		}
 	}
-	for _, v := range s.ctxs {
-		v.Destroy()
+	for i := len(s.shards) - 1; i >= 0; i-- {
+		shard := s.shards[i]
+		defer func() { err = stderrors.Join(err, shard.close()) }()
+	}
+	if s.stopper != nil {
+		s.stopper.Stop()
 	}
 	return err
 }

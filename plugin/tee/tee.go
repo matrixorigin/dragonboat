@@ -15,15 +15,17 @@
 package tee
 
 import (
+	"errors"
 	"github.com/lni/dragonboat/v4/config"
 	tl "github.com/lni/dragonboat/v4/internal/logdb/tee"
 	"github.com/lni/dragonboat/v4/internal/tan"
+	"github.com/lni/dragonboat/v4/logger"
 	"github.com/lni/dragonboat/v4/raftio"
 )
 
 // CreateTanPebbleLogDB creates a Tee LogDB backed by Tan and Pebble.
 func CreateTanPebbleLogDB(cfg config.NodeHostConfig, cb config.LogDBCallback,
-	dirs []string, wals []string) (raftio.ILogDB, error) {
+	dirs []string, wals []string) (_ raftio.ILogDB, err error) {
 	ndirs := make([]string, 0)
 	nwals := make([]string, 0)
 	fs := cfg.Expert.FS
@@ -37,11 +39,26 @@ func CreateTanPebbleLogDB(cfg config.NodeHostConfig, cb config.LogDBCallback,
 	if err != nil {
 		return nil, err
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			cleanupErr := tdb.Close()
+			if cleanupErr != nil {
+				if err != nil {
+					err = errors.Join(err, cleanupErr)
+				} else {
+					logger.GetLogger("LogDB").Errorf("Tee constructor rollback: %v", cleanupErr)
+				}
+			}
+		}
+	}()
 	pdb, err := tl.NewPebbleLogDB(cfg, cb, dirs, wals)
 	if err != nil {
 		return nil, err
 	}
-	return tl.MakeTeeLogDB(tdb, pdb), nil
+	result := tl.MakeTeeLogDB(tdb, pdb)
+	completed = true
+	return result, nil
 }
 
 // TanPebbleLogDBFactory is the factory for creating a tan and pebble backed
