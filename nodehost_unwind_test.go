@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/lni/dragonboat/v4/config"
 	"github.com/lni/dragonboat/v4/internal/server"
+	"github.com/lni/dragonboat/v4/internal/transport"
 	"github.com/lni/dragonboat/v4/internal/vfs"
 	"github.com/lni/dragonboat/v4/raftio"
 	"github.com/lni/goutils/leaktest"
@@ -162,5 +163,133 @@ func TestNodeHostCloseBeforeWorkersInitialized(t *testing.T) {
 	nh.Close()
 	if atomic.LoadInt32(&nh.closed) != 1 {
 		t.Fatal("partial host was not closed")
+	}
+}
+
+type unwindNodeHostTransport struct {
+	raftio.ITransport
+	handle      io.Closer
+	nameFailure func()
+	goexitStart bool
+	closes      int32
+}
+
+func (c *unwindNodeHostTransport) Name() string {
+	if c.nameFailure != nil {
+		c.nameFailure()
+	}
+	return c.ITransport.Name()
+}
+func (c *unwindNodeHostTransport) Start() error {
+	if c.goexitStart {
+		runtime.Goexit()
+	}
+	return c.ITransport.Start()
+}
+func (c *unwindNodeHostTransport) Close() error {
+	atomic.AddInt32(&c.closes, 1)
+	if err := c.handle.Close(); err != nil {
+		return err
+	}
+	if err := c.ITransport.Close(); err != nil {
+		return err
+	}
+	return errors.New("secondary transport close error")
+}
+
+type unwindNodeHostTransportFactory struct{ child *unwindNodeHostTransport }
+
+func (f unwindNodeHostTransportFactory) Validate(string) bool { return true }
+func (f unwindNodeHostTransportFactory) Create(cfg config.NodeHostConfig, h raftio.MessageHandler, ch raftio.ChunkHandler) raftio.ITransport {
+	handle, err := cfg.Expert.FS.Create(cfg.Expert.FS.PathJoin(cfg.NodeHostDir, "transport-handle"))
+	if err != nil {
+		panic(err)
+	}
+	f.child.handle = handle
+	f.child.ITransport = transport.NewNOOPTransport(cfg, h, ch)
+	return f.child
+}
+
+type unwindNodeHostLogDB struct {
+	noopLogDB
+	closes int32
+}
+
+func (l *unwindNodeHostLogDB) Close() error { atomic.AddInt32(&l.closes, 1); return nil }
+
+func TestNodeHostTransportConstructorUnwind(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	failure := errors.New("transport name failed")
+	for _, goexit := range []bool{false, true} {
+		name := "name_panic"
+		if goexit {
+			name = "start_goexit"
+		}
+		t.Run(name, func(t *testing.T) {
+			fs := &constructorLockFS{IFS: vfs.NewMemFS()}
+			child := &unwindNodeHostTransport{goexitStart: goexit}
+			if !goexit {
+				child.nameFailure = func() { panic(failure) }
+			}
+			t.Cleanup(func() {
+				if child.handle != nil && atomic.LoadInt32(&child.closes) == 0 {
+					_ = child.handle.Close()
+				}
+				for _, l := range fs.locks {
+					if atomic.LoadInt32(&l.closes) == 0 {
+						_ = l.Closer.Close()
+					}
+				}
+				vfs.ReportLeakedFD(fs.IFS, t)
+			})
+			ldb := &unwindNodeHostLogDB{}
+			listener := &testSysEventListener{}
+			cfg := config.NodeHostConfig{NodeHostDir: "/constructor", WALDir: "/wal", RTTMillisecond: 10, RaftAddress: "127.0.0.1:1", SystemEventListener: listener}
+			cfg.Expert.FS = fs
+			cfg.Expert.Engine = config.EngineConfig{ExecShards: 1, CommitShards: 1, ApplyShards: 1, SnapshotShards: 1, CloseShards: 1}
+			cfg.Expert.LogDBFactory = &testLogDBFactory{ldb: ldb}
+			cfg.Expert.TransportFactory = unwindNodeHostTransportFactory{child: child}
+			var owner *NodeHost
+			var got any
+			returned := false
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() { got = recover() }()
+				owner, _ = NewNodeHost(cfg)
+				returned = true
+			}()
+			<-done
+			if owner != nil {
+				owner.Close()
+				t.Fatal("failed constructor published host")
+			}
+			if returned {
+				t.Error("abrupt constructor returned normally")
+			}
+			if (!goexit && got != failure) || (goexit && got != nil) {
+				t.Errorf("original unwind lost: %#v", got)
+			}
+			if n := atomic.LoadInt32(&child.closes); n != 1 {
+				t.Errorf("transport closes=%d want1", n)
+			}
+			if n := atomic.LoadInt32(&ldb.closes); n != 1 {
+				t.Errorf("logdb closes=%d want1", n)
+			}
+			if len(fs.locks) != 2 {
+				t.Fatalf("locks=%d want2", len(fs.locks))
+			}
+			for _, l := range fs.locks {
+				if n := atomic.LoadInt32(&l.closes); n != 1 {
+					t.Errorf("lock closes=%d want1", n)
+				}
+			}
+			listener.mu.Lock()
+			shutdowns := listener.nodeHostShuttingdown
+			listener.mu.Unlock()
+			if shutdowns != 1 {
+				t.Errorf("shutdowns=%d want1", shutdowns)
+			}
+		})
 	}
 }

@@ -223,6 +223,16 @@ func NewTransport(nhConfig config.NodeHostConfig,
 	t.trans = create(nhConfig, t.handleRequest, chunks.Add)
 	t.chunks = chunks
 	t.ctx, t.cancel = context.WithCancel(context.Background())
+	initialized := false
+	defer func() {
+		if !initialized {
+			// The child is owned here until successful handoff, including on Goexit.
+			// Returned cleanup errors must not replace the acquisition failure.
+			if err := t.Close(); err != nil {
+				plog.Errorf("failed to close partially initialized transport: %v", err)
+			}
+		}
+	}()
 	t.mu.queues = make(map[string]sendQueue)
 	t.mu.breakers = make(map[string]*circuit.Breaker)
 	msgConn := func() float64 {
@@ -238,9 +248,6 @@ func NewTransport(nhConfig config.NodeHostConfig,
 	plog.Infof("transport type: %s", t.trans.Name())
 	if err := t.trans.Start(); err != nil {
 		plog.Errorf("transport failed to start %v", err)
-		if cerr := t.trans.Close(); cerr != nil {
-			plog.Errorf("failed to close the transport module %v", cerr)
-		}
 		return nil, err
 	}
 	t.stopper.RunWorker(func() {
@@ -255,6 +262,7 @@ func NewTransport(nhConfig config.NodeHostConfig,
 			}
 		}
 	})
+	initialized = true
 	return t, nil
 }
 
