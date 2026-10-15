@@ -408,16 +408,24 @@ func (d *db) getEntries(shardID uint64, replicaID uint64,
 			}
 			return true
 		}
-		err := d.readLog(ies[passed], f)
+		before := passed
+		ie := ies[passed]
+		err := d.readLog(ie, f)
 		if err != nil {
 			return nil, 0, err
 		}
-		// read to the end, do not advance cur and continue with the current index.
-		if err == io.EOF {
-			continue
-		}
 		if done {
 			return entries, size, nil
+		}
+		// readLog treats EOF as a successful end of a scan. If it did not
+		// consume an index entry, reopening the same position cannot make
+		// progress (for example, a persisted index points at EOF). Fail the
+		// indexed read rather than spinning or silently skipping missing logs.
+		// A size-limited read above can stop within an index entry legitimately.
+		if passed == before {
+			return nil, 0, errors.Errorf(
+				"tan: no progress reading shard %d replica %d index %d (log %s offset %d)",
+				shardID, replicaID, expected, ie.fileNum, ie.pos)
 		}
 	}
 	return entries, size, nil
