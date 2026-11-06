@@ -1035,6 +1035,12 @@ func (p *pendingProposal) dropped(clientID uint64,
 	pp.dropped(clientID, seriesID, key)
 }
 
+func (p *pendingProposal) sendFailed(clientID uint64,
+	seriesID uint64, key uint64, uncertain bool) {
+	pp := p.shards[key%p.ps]
+	pp.sendFailed(clientID, seriesID, key, uncertain)
+}
+
 func (p *pendingProposal) applied(clientID uint64,
 	seriesID uint64, key uint64, result sm.Result, rejected bool) {
 	pp := p.shards[key%p.ps]
@@ -1173,6 +1179,17 @@ func (p *proposalShard) committed(clientID uint64, seriesID uint64, key uint64) 
 func (p *proposalShard) dropped(clientID uint64, seriesID uint64, key uint64) {
 	if ps := p.getProposal(clientID, seriesID, key, p.getTick()); ps != nil {
 		ps.dropped()
+	}
+}
+
+func (p *proposalShard) sendFailed(clientID uint64, seriesID uint64,
+	key uint64, uncertain bool) {
+	if ps := p.getProposal(clientID, seriesID, key, p.getTick()); ps != nil {
+		if uncertain {
+			ps.timeout()
+		} else {
+			ps.dropped()
+		}
 	}
 }
 

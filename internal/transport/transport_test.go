@@ -16,6 +16,7 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"fmt"
 	"io"
@@ -249,6 +250,139 @@ func (h *testMessageHandler) HandleUnreachable(shardID uint64,
 		h.unreachableCount[epk] = v + 1
 	} else {
 		h.unreachableCount[epk] = 1
+	}
+}
+
+func (h *testMessageHandler) HandleSendFailure(msg raftpb.Message, uncertain bool) {
+}
+
+type sendFailureRecord struct {
+	message   raftpb.Message
+	uncertain bool
+}
+
+type sendFailureHandler struct {
+	*testMessageHandler
+	failures chan sendFailureRecord
+}
+
+func (h *sendFailureHandler) HandleSendFailure(msg raftpb.Message, uncertain bool) {
+	h.failures <- sendFailureRecord{message: msg, uncertain: uncertain}
+}
+
+type gatedFailedConnection struct {
+	raftio.ITransport
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedFailedConnection) GetConnection(ctx context.Context,
+	target string) (raftio.IConnection, error) {
+	close(g.entered)
+	select {
+	case <-g.release:
+		return nil, ErrRequestedToFail
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestAcceptedProposalsAreReportedWhenConnectionFails(t *testing.T) {
+	handler := &sendFailureHandler{
+		testMessageHandler: newTestMessageHandler(),
+		failures:           make(chan sendFailureRecord, 16),
+	}
+	trans, nodes, _, _, _ := newNOOPTestTransport(handler, vfs.GetTestFS())
+	defer func() {
+		if err := trans.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	nodes.Add(100, 2, serverAddress)
+	gate := &gatedFailedConnection{
+		ITransport: trans.trans,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	trans.trans = gate
+	const count = 10
+	for key := uint64(1); key <= count; key++ {
+		msg := raftpb.Message{
+			Type: raftpb.Propose, ShardID: 100, From: 1, To: 2,
+			Entries: []raftpb.Entry{{Key: key, Type: raftpb.ApplicationEntry}},
+		}
+		if !trans.Send(msg) {
+			t.Fatalf("proposal %d was not accepted", key)
+		}
+	}
+	<-gate.entered
+	close(gate.release)
+	seen := make(map[uint64]bool)
+	for i := 0; i < count; i++ {
+		select {
+		case failure := <-handler.failures:
+			if failure.uncertain || len(failure.message.Entries) != 1 {
+				t.Fatalf("wrong failure feedback: %+v", failure)
+			}
+			key := failure.message.Entries[0].Key
+			if seen[key] {
+				t.Fatalf("proposal %d reported twice", key)
+			}
+			seen[key] = true
+		case <-time.After(5 * time.Second):
+			t.Fatal("accepted proposal was not reported")
+		}
+	}
+}
+
+func TestProposalSendFailureFeedback(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		register    bool
+		breakerFail bool
+		connectFail bool
+		batchFail   bool
+		accepted    bool
+		uncertain   bool
+	}{
+		{name: "unknown target"},
+		{name: "circuit breaker", register: true, breakerFail: true},
+		{name: "connection failure", register: true, connectFail: true, accepted: true},
+		{name: "batch write failure", register: true, batchFail: true, accepted: true, uncertain: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &sendFailureHandler{
+				testMessageHandler: newTestMessageHandler(),
+				failures:           make(chan sendFailureRecord, 1),
+			}
+			trans, nodes, _, request, connection := newNOOPTestTransport(handler, vfs.GetTestFS())
+			defer func() {
+				if err := trans.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}()
+			if tc.register {
+				nodes.Add(100, 2, serverAddress)
+			}
+			if tc.breakerFail {
+				trans.GetCircuitBreaker(serverAddress).Fail()
+			}
+			connection.SetToFail(tc.connectFail)
+			request.SetToFail(tc.batchFail)
+			msg := raftpb.Message{Type: raftpb.Propose, ShardID: 100, From: 1, To: 2}
+			if got := trans.Send(msg); got != tc.accepted {
+				t.Fatalf("send accepted = %t, want %t", got, tc.accepted)
+			}
+			select {
+			case failure := <-handler.failures:
+				if failure.message.ShardID != msg.ShardID ||
+					failure.message.From != msg.From || failure.uncertain != tc.uncertain {
+					t.Fatalf("wrong failure feedback: %+v", failure)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("send failure was not reported")
+			}
+		})
 	}
 }
 
