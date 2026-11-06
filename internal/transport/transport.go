@@ -86,6 +86,9 @@ var (
 type IMessageHandler interface {
 	HandleMessageBatch(batch pb.MessageBatch) (uint64, uint64)
 	HandleUnreachable(shardID uint64, replicaID uint64)
+	// HandleSendFailure reports a message that was not delivered. uncertain is
+	// true when a failed batch write may have reached the remote NodeHost.
+	HandleSendFailure(msg pb.Message, uncertain bool)
 	HandleSnapshotStatus(shardID uint64, replicaID uint64, rejected bool)
 	HandleSnapshot(shardID uint64, replicaID uint64, from uint64)
 }
@@ -356,6 +359,7 @@ func (t *Transport) Send(req pb.Message) bool {
 	v, _ := t.send(req)
 	if !v {
 		t.metrics.messageSendFailure(1)
+		t.msgHandler.HandleSendFailure(req, false)
 	}
 	return v
 }
@@ -376,7 +380,8 @@ func (t *Transport) send(req pb.Message) (bool, failedSend) {
 		t.metrics.messageConnectionFailure()
 		return false, circuitBreakerNotReady
 	}
-	// get the channel, create it in case it is not in the queue map
+	// Keep lookup and enqueue under the same lock as queue removal. Otherwise a
+	// sender can enqueue on a queue after its worker has drained and removed it.
 	t.mu.Lock()
 	sq, ok := t.mu.queues[key]
 	if !ok {
@@ -386,22 +391,8 @@ func (t *Transport) send(req pb.Message) (bool, failedSend) {
 		}
 		t.mu.queues[key] = sq
 	}
-	t.mu.Unlock()
-	if !ok {
-		shutdownQueue := func() {
-			t.mu.Lock()
-			delete(t.mu.queues, key)
-			t.mu.Unlock()
-		}
-		t.stopper.RunWorker(func() {
-			affected := make(nodeMap)
-			if !t.connectAndProcess(addr, sq, from, affected) {
-				t.notifyUnreachable(addr, affected)
-			}
-			shutdownQueue()
-		})
-	}
 	if sq.rateLimited() {
+		t.mu.Unlock()
 		return false, rateLimited
 	}
 
@@ -409,9 +400,34 @@ func (t *Transport) send(req pb.Message) (bool, failedSend) {
 
 	select {
 	case sq.ch <- req:
+		t.mu.Unlock()
+		if !ok {
+			t.stopper.RunWorker(func() {
+				affected := make(nodeMap)
+				connected := t.connectAndProcess(addr, sq, from, affected)
+				t.mu.Lock()
+				delete(t.mu.queues, key)
+				t.mu.Unlock()
+				// Once removed, no sender can enqueue on this queue again.
+				for {
+					select {
+					case pending := <-sq.ch:
+						sq.decrease(pending)
+						t.metrics.messageSendFailure(1)
+						t.msgHandler.HandleSendFailure(pending, false)
+					default:
+						if !connected {
+							t.notifyUnreachable(addr, affected)
+						}
+						return
+					}
+				}
+			})
+		}
 		return true, success
 	default:
 		sq.decrease(req)
+		t.mu.Unlock()
 		return false, chanIsFull
 	}
 }
@@ -483,6 +499,9 @@ func (t *Transport) processMessages(remoteHost string,
 					sz += uint64(req.SizeUpperLimit())
 					requests = append(requests, req)
 				case <-t.stopper.ShouldStop():
+					for _, pending := range requests {
+						t.msgHandler.HandleSendFailure(pending, false)
+					}
 					return nil
 				default:
 					done = true
@@ -497,6 +516,12 @@ func (t *Transport) processMessages(remoteHost string,
 				batch.Requests = requests[:len(requests)-1]
 			}
 			if err := t.sendMessageBatch(conn, batch); err != nil {
+				for _, failed := range batch.Requests {
+					t.msgHandler.HandleSendFailure(failed, true)
+				}
+				if twoBatch {
+					t.msgHandler.HandleSendFailure(requests[len(requests)-1], false)
+				}
 				plog.Errorf("send batch failed, target %s (%v), %d",
 					remoteHost, err, len(batch.Requests))
 				return err
@@ -504,6 +529,7 @@ func (t *Transport) processMessages(remoteHost string,
 			if twoBatch {
 				batch.Requests = []pb.Message{requests[len(requests)-1]}
 				if err := t.sendMessageBatch(conn, batch); err != nil {
+					t.msgHandler.HandleSendFailure(requests[len(requests)-1], true)
 					plog.Errorf("send batch failed, taret node %s (%v), %d",
 						remoteHost, err, len(batch.Requests))
 					return err

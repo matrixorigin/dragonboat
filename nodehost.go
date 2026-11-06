@@ -2277,6 +2277,22 @@ func (h *messageHandler) HandleUnreachable(shardID uint64, replicaID uint64) {
 	}
 }
 
+func (h *messageHandler) HandleSendFailure(msg pb.Message, uncertain bool) {
+	// Only the origin replica owns the pending request. A failed Raft message
+	// from another replica must not complete an unrelated local proposal.
+	if msg.Type != pb.Propose {
+		return
+	}
+	if n, ok := h.nh.getShard(msg.ShardID); ok && n.replicaID == msg.From {
+		for _, entry := range msg.Entries {
+			if entry.IsProposal() {
+				n.pendingProposals.sendFailed(entry.ClientID, entry.SeriesID,
+					entry.Key, uncertain)
+			}
+		}
+	}
+}
+
 func (h *messageHandler) HandleSnapshot(shardID uint64,
 	replicaID uint64, from uint64) {
 	m := pb.Message{

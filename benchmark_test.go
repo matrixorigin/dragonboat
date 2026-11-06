@@ -384,6 +384,9 @@ func (h *benchmarkMessageHandler) HandleMessageBatch(batch pb.MessageBatch) (uin
 func (h *benchmarkMessageHandler) HandleUnreachable(shardID uint64, replicaID uint64) {
 }
 
+func (h *benchmarkMessageHandler) HandleSendFailure(msg pb.Message, uncertain bool) {
+}
+
 func (h *benchmarkMessageHandler) HandleSnapshotStatus(shardID uint64,
 	replicaID uint64, rejected bool) {
 }
