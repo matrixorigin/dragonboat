@@ -32,6 +32,18 @@ type failExportRenameFS struct {
 	fail atomic.Bool
 }
 
+type failExportCleanupFS struct {
+	vfs.IFS
+	fail atomic.Bool
+}
+
+func (fs *failExportCleanupFS) RemoveAll(path string) error {
+	if strings.HasSuffix(path, ".generating") && fs.fail.CompareAndSwap(true, false) {
+		return syscall.EIO
+	}
+	return fs.IFS.RemoveAll(path)
+}
+
 func (fs *failExportRenameFS) Rename(oldname, newname string) error {
 	if strings.HasSuffix(oldname, ".generating") &&
 		strings.Contains(newname, "exported-snapshot-error") && fs.fail.CompareAndSwap(true, false) {
@@ -93,6 +105,62 @@ func TestExportCommitErrorReturnsWithoutStoppingNodeHost(t *testing.T) {
 			if err != nil {
 				t.Fatalf("retry export failed: %v", err)
 			}
+		},
+	}
+	runNodeHostTest(t, to, baseFS)
+}
+
+func TestExportAbortCleanupErrorReturnsWithoutStoppingNodeHost(t *testing.T) {
+	baseFS := vfs.GetTestFS()
+	fs := &failExportCleanupFS{IFS: baseFS}
+	to := &testOption{
+		defaultTestNode: true,
+		tf: func(nh *NodeHost) {
+			n, ok := nh.getShard(1)
+			if !ok {
+				t.Fatal("shard missing")
+			}
+			originalFS := n.snapshotter.fs
+			n.snapshotter.fs = fs
+			defer func() { n.snapshotter.fs = originalFS }()
+			path := "exported-snapshot-abort-cleanup"
+			if err := fs.MkdirAll(path, 0755); err != nil {
+				t.Fatal(err)
+			}
+			defer fs.RemoveAll(path)
+			propose := func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if _, err := nh.SyncPropose(ctx, nh.GetNoOPSession(1), []byte("record")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			propose()
+			opt := SnapshotOption{Exported: true, ExportPath: path}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_, err := nh.SyncRequestSnapshot(ctx, 1, opt)
+			cancel()
+			if err != nil {
+				t.Fatalf("initial export failed: %v", err)
+			}
+			// A second export at the same index aborts because the final
+			// directory exists. Failure to remove its temporary directory
+			// must reach the caller without panicking the snapshot worker.
+			fs.fail.Store(true)
+			ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+			_, err = nh.SyncRequestSnapshot(ctx, 1, opt)
+			cancel()
+			if !errors.Is(err, syscall.EIO) {
+				t.Fatalf("expected cleanup EIO, got %v", err)
+			}
+			var exportErr *SnapshotExportError
+			if !errors.As(err, &exportErr) {
+				t.Fatalf("expected export failure, got %T", err)
+			}
+			if fs.fail.Load() {
+				t.Fatal("export cleanup injection was not reached")
+			}
+			propose()
 		},
 	}
 	runNodeHostTest(t, to, baseFS)

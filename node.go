@@ -775,7 +775,9 @@ func (n *node) doSave(req rsm.SSRequest) (uint64, error) {
 	if err != nil {
 		if saveAborted(err) {
 			plog.Warningf("%s save snapshot aborted, %v", n.id(), err)
-			ssenv.MustRemoveTempDir()
+			if cleanupErr := ssenv.RemoveTempDir(); cleanupErr != nil {
+				return 0, errors.Wrapf(cleanupErr, "%s remove aborted snapshot temp dir failed", n.id())
+			}
 			n.pendingSnapshot.apply(req.Key, false, true, 0)
 			return 0, nil
 		} else if isSoftSnapshotError(err) {
@@ -791,7 +793,9 @@ func (n *node) doSave(req rsm.SSRequest) (uint64, error) {
 			// saveAborted() will only be true in monkey test
 			// commit abort happens when the final dir already exists, probably due to
 			// incoming snapshot
-			ssenv.MustRemoveTempDir()
+			if cleanupErr := ssenv.RemoveTempDir(); cleanupErr != nil {
+				return 0, errors.Wrapf(cleanupErr, "%s remove aborted snapshot temp dir failed", n.id())
+			}
 			return 0, nil
 		}
 		return 0, errors.Wrapf(err, "%s commit snapshot failed", n.id())
