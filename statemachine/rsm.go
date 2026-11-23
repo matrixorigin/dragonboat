@@ -108,12 +108,14 @@ type Result struct {
 	Data []byte
 }
 
-// Entry represents a Raft log entry that is going to be provided to the Update
-// method of an IConcurrentStateMachine or IOnDiskStateMachine instance.
+// Entry represents a Raft log entry provided to a state machine's Update method.
 type Entry struct {
 	// Index is the Raft log index of the entry. The field is set by the
 	// Dragonboat library and it is strictly read-only.
 	Index uint64
+	// Term is the Raft term in which the entry was appended. The field is set by
+	// the Dragonboat library and it is strictly read-only.
+	Term uint64
 	// Cmd is the proposed command. This field is strictly read-only.
 	Cmd []byte
 	// Result is the result value obtained from the Update method of an
@@ -147,8 +149,8 @@ type IStateMachine interface {
 	//
 	// The Update method must be deterministic, meaning given the same initial
 	// state of IStateMachine and the same input, it should always reach to the
-	// same updated state and outputs the same returned value. This requires the
-	// input byte slice should be the only input to this method. Reading from
+	// same updated state and outputs the same returned value. The entry must be
+	// the only input to this method. Reading from
 	// system clock, random number generator or other similar data sources will
 	// likely violate the deterministic requirement of the Update method.
 	//

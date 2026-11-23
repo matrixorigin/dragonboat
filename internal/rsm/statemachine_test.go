@@ -303,6 +303,91 @@ func runSMTest2(t *testing.T,
 	reportLeakedFD(fs, t)
 }
 
+type recordingInMemSM struct {
+	sm.IStateMachine
+	entries []sm.Entry
+}
+
+func (s *recordingInMemSM) Update(e sm.Entry) (sm.Result, error) {
+	s.entries = append(s.entries, e)
+	return sm.Result{}, nil
+}
+
+type recordingConcurrentSM struct {
+	sm.IConcurrentStateMachine
+	entries []sm.Entry
+}
+
+func (s *recordingConcurrentSM) Update(entries []sm.Entry) ([]sm.Entry, error) {
+	s.entries = append(s.entries, entries...)
+	return entries, nil
+}
+
+type recordingOnDiskSM struct {
+	sm.IOnDiskStateMachine
+	entries []sm.Entry
+}
+
+func (s *recordingOnDiskSM) Update(entries []sm.Entry) ([]sm.Entry, error) {
+	s.entries = append(s.entries, entries...)
+	return entries, nil
+}
+
+func TestAppliedEntriesIncludeTheirRaftTerms(t *testing.T) {
+	config := config.Config{ShardID: 1, ReplicaID: 1}
+	entries := []pb.Entry{
+		{ClientID: 123, SeriesID: client.NoOPSeriesID, Index: 1, Term: 3, Cmd: []byte("one")},
+		{ClientID: 123, SeriesID: client.NoOPSeriesID, Index: 2, Term: 4, Cmd: []byte("two")},
+		{ClientID: 123, SeriesID: client.NoOPSeriesID, Index: 3, Term: 4, Cmd: []byte("three")},
+	}
+	verify := func(t *testing.T, got []sm.Entry, want []pb.Entry) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("received %d entries, want %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i].Index != want[i].Index || got[i].Term != want[i].Term || !bytes.Equal(got[i].Cmd, want[i].Cmd) {
+				t.Errorf("entry %d = %+v, want index=%d term=%d cmd=%q", i, got[i], want[i].Index, want[i].Term, want[i].Cmd)
+			}
+		}
+	}
+
+	t.Run("regular", func(t *testing.T) {
+		user := &recordingInMemSM{IStateMachine: tests.NewKVTest(1, 1)}
+		managed := NewNativeSM(config, NewInMemStateMachine(user), make(chan struct{}))
+		state := NewStateMachine(managed, nil, config, newTestNodeProxy(), vfs.GetTestFS())
+		for _, e := range entries {
+			if err := state.handleEntry(e, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		verify(t, user.entries, entries)
+	})
+
+	t.Run("concurrent", func(t *testing.T) {
+		user := &recordingConcurrentSM{IConcurrentStateMachine: tests.NewConcurrentKVTest(1, 1)}
+		managed := NewNativeSM(config, NewConcurrentStateMachine(user), make(chan struct{}))
+		state := NewStateMachine(managed, nil, config, newTestNodeProxy(), vfs.GetTestFS())
+		if err := state.handleBatch(entries, nil); err != nil {
+			t.Fatal(err)
+		}
+		verify(t, user.entries, entries)
+	})
+
+	t.Run("on-disk skips applied prefix", func(t *testing.T) {
+		user := &recordingOnDiskSM{IOnDiskStateMachine: tests.NewFakeDiskSM(1)}
+		managed := NewNativeSM(config, NewOnDiskStateMachine(user), make(chan struct{}))
+		state := NewStateMachine(managed, nil, config, newTestNodeProxy(), vfs.GetTestFS())
+		if _, err := state.OpenOnDiskStateMachine(); err != nil {
+			t.Fatal(err)
+		}
+		if err := state.handleBatch(entries, nil); err != nil {
+			t.Fatal(err)
+		}
+		verify(t, user.entries, entries[1:])
+	})
+}
+
 func TestDefaultTaskIsNotSnapshotTask(t *testing.T) {
 	task := Task{}
 	if task.IsSnapshotTask() {
