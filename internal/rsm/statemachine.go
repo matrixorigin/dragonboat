@@ -988,7 +988,7 @@ func (s *StateMachine) handleBatch(input []pb.Entry, ents []sm.Entry) error {
 			if err != nil {
 				return err
 			}
-			ents = append(ents, sm.Entry{Index: e.Index, Cmd: payload})
+			ents = append(ents, sm.Entry{Index: e.Index, Term: e.Term, Cmd: payload})
 		} else {
 			skipped++
 			s.setApplied(e.Index, e.Term)
@@ -1091,7 +1091,7 @@ func (s *StateMachine) update(e pb.Entry) (sm.Result, bool, bool, error) {
 	if err != nil {
 		return sm.Result{}, false, false, err
 	}
-	r, err := s.sm.Update(sm.Entry{Index: e.Index, Cmd: payload})
+	r, err := s.sm.Update(sm.Entry{Index: e.Index, Term: e.Term, Cmd: payload})
 	if err != nil {
 		return sm.Result{}, false, false, err
 	}
